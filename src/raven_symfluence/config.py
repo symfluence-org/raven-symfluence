@@ -47,6 +47,12 @@ class RavenConfig(BaseModel):
         alias="RAVEN_SPATIAL_MODE",
         description="lumped (single HRU/subbasin) or distributed (HRUs + routing topology)",
     )
+    routing_method: str = Field(
+        default="ROUTE_DIFFUSIVE_WAVE",
+        alias="RAVEN_ROUTING_METHOD",
+        description="Raven in-channel routing method for distributed mode (e.g. "
+                    "ROUTE_DIFFUSIVE_WAVE, ROUTE_HYDROLOGIC, ROUTE_NONE)",
+    )
 
     # Binary / paths
     install_path: str = Field(default="default", alias="RAVEN_INSTALL_PATH")

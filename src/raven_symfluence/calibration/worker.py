@@ -201,9 +201,12 @@ class RavenWorker(BaseWorker):
     ) -> Dict[str, Any]:
         """Multi-gauge KGE objective via the shared MultiGaugeMetrics helper.
 
-        Phase 1 targets lumped GR4JCN (single outlet), so multi-gauge is wired but
-        gated: it requires GAUGE_SEGMENT_MAPPING + MULTI_GAUGE_OBS_DIR and a routed
-        per-reach Hydrographs output, available once distributed Raven lands.
+        Distributed Raven writes one ``sub<ID> [m3/s]`` column per gauged subbasin into
+        Hydrographs.csv. We convert those per-reach series into the mizuRoute-style routed
+        NetCDF (``seg``/``segId``/``IRFroutedRunoff``) that :class:`MultiGaugeMetrics`
+        consumes, so Raven shares the exact multi-gauge objective used by SUMMA/FUSE.
+        Requires GAUGE_SEGMENT_MAPPING (gauge id -> subbasin id) + MULTI_GAUGE_OBS_DIR and a
+        distributed run (RAVEN_SPATIAL_MODE=distributed) that produced per-reach output.
         """
         try:
             from symfluence.optimization.multi_gauge.metrics import MultiGaugeMetrics
@@ -217,9 +220,24 @@ class RavenWorker(BaseWorker):
                 return {'kge': self.penalty_score}
 
             sim_dir = Path(kwargs.get('sim_dir') or output_dir)
-            from ..postprocessor import find_hydrographs_file
+            from ..postprocessor import (
+                find_hydrographs_file,
+                read_raven_per_reach,
+                write_routed_netcdf,
+            )
             hydro_file = find_hydrographs_file(sim_dir)
             if hydro_file is None:
+                return {'kge': self.penalty_score}
+
+            per_reach = read_raven_per_reach(hydro_file, self.logger)
+            if per_reach is None or per_reach.empty:
+                self.logger.error(
+                    "No per-reach Raven output for multi-gauge calibration "
+                    "(is RAVEN_SPATIAL_MODE=distributed?)")
+                return {'kge': self.penalty_score}
+            routed_nc = write_routed_netcdf(
+                per_reach, sim_dir / 'raven_routed_flow.nc', self.logger)
+            if routed_nc is None:
                 return {'kge': self.penalty_score}
 
             calib_period = config.get('CALIBRATION_PERIOD', '')
@@ -233,12 +251,15 @@ class RavenWorker(BaseWorker):
                 logger=self.logger,
             )
             results = multi_gauge.calculate_multi_gauge_metrics(
-                mizuroute_output_path=hydro_file,
+                mizuroute_output_path=routed_nc,
                 gauge_ids=config.get('MULTI_GAUGE_IDS'),
                 start_date=start_date,
                 end_date=end_date,
+                min_gauges=int(config.get('MULTI_GAUGE_MIN_GAUGES', 1)),
                 aggregation=config.get('MULTI_GAUGE_AGGREGATION', 'mean'),
                 min_overlap_days=int(config.get('MULTI_GAUGE_MIN_OVERLAP_DAYS', 10)),
+                kge_floor=(float(config['MULTI_GAUGE_KGE_FLOOR'])
+                           if config.get('MULTI_GAUGE_KGE_FLOOR') is not None else None),
             )
             return {
                 'kge': results['kge'],

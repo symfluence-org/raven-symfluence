@@ -11,6 +11,7 @@ and shared helpers (also reused by the runner, worker, and calibration target).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +21,9 @@ from symfluence.models.base import StandardModelPostProcessor
 
 # Raven Hydrographs.csv non-discharge columns (the leading date/time block).
 _NON_FLOW_COLUMNS = {'time', 'date', 'hour', 'precip', 'precip [mm/day]'}
+
+# Raven names each gauged subbasin column like "sub_3 [m3/s]" or "sub3 [m3/s]"; capture the id.
+_SUBBASIN_COL_RE = re.compile(r'sub_?(\d+)\b')
 
 
 def find_hydrographs_file(sim_dir: Path) -> Optional[Path]:
@@ -94,6 +98,92 @@ def read_raven_streamflow(
         return None
 
 
+def _hydrographs_datetime_index(df: pd.DataFrame) -> Optional[pd.DatetimeIndex]:
+    """Build a datetime index from a Raven Hydrographs.csv frame's date(+hour) columns."""
+    date_col = next((c for c in df.columns if c.lower() == 'date'), None)
+    if date_col is None:
+        return None
+    hour_col = next((c for c in df.columns if c.lower() == 'hour'), None)
+    if hour_col is not None:
+        return pd.to_datetime(
+            df[date_col].astype(str) + ' ' + df[hour_col].astype(str), errors='coerce')
+    return pd.to_datetime(df[date_col], errors='coerce')
+
+
+def read_raven_per_reach(
+    hydrographs_file: Path,
+    logger: logging.Logger,
+) -> Optional[pd.DataFrame]:
+    """Read every gauged subbasin's discharge (m3/s) from a Raven Hydrographs.csv.
+
+    Returns a DataFrame indexed by datetime whose integer columns are subbasin ids
+    (parsed from the ``sub<ID> [m3/s]`` headers) — the per-reach routed flow the
+    multi-gauge objective needs. Returns None if no subbasin columns are present.
+    """
+    try:
+        df = pd.read_csv(hydrographs_file, skipinitialspace=True)
+        df.columns = [str(c).strip() for c in df.columns]
+        idx = _hydrographs_datetime_index(df)
+        if idx is None:
+            logger.error(f"No 'date' column in {hydrographs_file}")
+            return None
+        df.index = idx
+
+        cols: dict = {}
+        for c in df.columns:
+            if 'precip' in c.lower() or not pd.api.types.is_numeric_dtype(df[c]):
+                continue
+            m = _SUBBASIN_COL_RE.search(c.lower())
+            if m:
+                cols[int(m.group(1))] = df[c].astype(float)
+        if not cols:
+            logger.debug(f"No 'sub<ID>' reach columns in {hydrographs_file}")
+            return None
+        out = pd.DataFrame(cols)
+        out = out[out.index.notna()]
+        logger.debug(f"Read {len(out.columns)} reach hydrographs from {hydrographs_file.name}")
+        return out
+    except Exception as e:  # noqa: BLE001 -- model execution resilience
+        logger.error(f"Error reading per-reach Raven Hydrographs.csv: {e}")
+        return None
+
+
+def write_routed_netcdf(
+    per_reach: pd.DataFrame,
+    out_path: Path,
+    logger: logging.Logger,
+) -> Optional[Path]:
+    """Write per-reach flow to a mizuRoute-style NetCDF for ``MultiGaugeMetrics``.
+
+    SYMFLUENCE's :class:`MultiGaugeMetrics` reads routed flow from a NetCDF with a ``seg``
+    dimension, a ``segId`` variable, and an ``IRFroutedRunoff(time, seg)`` variable in
+    m3/s. We emit exactly that layout from Raven's per-reach columns so the same
+    multi-gauge objective serves Raven, SUMMA/mizuRoute, and FUSE without special-casing.
+    """
+    try:
+        import numpy as np
+        import xarray as xr
+
+        seg_ids = list(per_reach.columns)
+        data = per_reach[seg_ids].to_numpy(dtype='float64')  # (time, seg)
+        ds = xr.Dataset(
+            {
+                'IRFroutedRunoff': (('time', 'seg'), data, {'units': 'm3/s'}),
+                'segId': (('seg',), np.asarray(seg_ids, dtype='int64')),
+            },
+            coords={'time': pd.to_datetime(per_reach.index)},
+        )
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ds.to_netcdf(out_path)
+        ds.close()
+        logger.debug(f"Wrote routed NetCDF ({len(seg_ids)} reaches) -> {out_path.name}")
+        return out_path
+    except Exception as e:  # noqa: BLE001 -- model execution resilience
+        logger.error(f"Error writing routed NetCDF: {e}")
+        return None
+
+
 class RavenPostProcessor(StandardModelPostProcessor):
     """Postprocessor for the Raven hydrological modelling framework."""
 
@@ -135,4 +225,10 @@ class RavenPostProcessor(StandardModelPostProcessor):
             streamflow, model_column_name='RAVEN_discharge_cms')
 
 
-__all__ = ['RavenPostProcessor', 'find_hydrographs_file', 'read_raven_streamflow']
+__all__ = [
+    'RavenPostProcessor',
+    'find_hydrographs_file',
+    'read_raven_streamflow',
+    'read_raven_per_reach',
+    'write_routed_netcdf',
+]

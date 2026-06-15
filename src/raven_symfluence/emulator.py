@@ -330,6 +330,7 @@ def build_and_run_emulator(
     project_dir = data_dir / f"domain_{domain_name}"
     model_template = str(_cfg(config, 'RAVEN_MODEL_TEMPLATE', 'GR4JCN')).upper()
     run_name = str(_cfg(config, 'RAVEN_RUN_NAME', 'raven_run'))
+    spatial_mode = str(_cfg(config, 'RAVEN_SPATIAL_MODE', 'lumped')).lower()
 
     if forcing_basin_path is None:
         forcing_basin_path = _resolve_forcing_basin_path(project_dir)
@@ -362,11 +363,25 @@ def build_and_run_emulator(
         if emulator_cls is None:
             return False
 
-        # HRU(s) for the lumped catchment. Most emulators take a single generic land HRU;
-        # CanadianShield is validated to require exactly two (organic + bedrock), so it gets a
-        # dedicated builder that splits the catchment area between its two HRU subclasses.
-        hru_list = _build_hrus(emulators, hru, spec, logger)
         gauge = _build_gauge(rc, forcing_nc, hru, spec, logger)
+
+        # Resolve the spatial network. Distributed mode reads the attributes 'topology'
+        # group into a routed multi-subbasin network (one HRU per subbasin); it returns
+        # None for undelineated/single-subbasin domains, in which case we use the lumped
+        # construction. CanadianShield needs two HRUs per subbasin and is not supported in
+        # distributed mode yet, so it always uses the lumped two-HRU build.
+        network = None
+        if spatial_mode == 'distributed' and spec.get('hru_kind') != 'canadianshield':
+            from .distributed import build_distributed_objects, read_distributed_topology
+
+            network = read_distributed_topology(project_dir, domain_name, logger)
+            if network is None:
+                logger.info("Distributed mode requested but no routable topology found; "
+                            "running lumped")
+        elif spatial_mode == 'distributed':
+            logger.warning(
+                f"Distributed mode is not supported for {model_template} "
+                "(needs two HRUs per subbasin); running lumped")
 
         # GR4JCN defaults to NetCDF output (WriteNetcdfFormat=True); force CSV so the
         # postprocessor's Hydrographs.csv reader (read_raven_streamflow) finds its input.
@@ -376,13 +391,27 @@ def build_and_run_emulator(
         # overridden to PET_OUDIN, so PRECIP + TEMP_AVE alone suffice (see RAVEN_TEMPLATE_SPECS).
         config_kwargs: Dict[str, Any] = {
             'params': param_vector,
-            'HRUs': hru_list,
             'Gauge': [gauge],
             'StartDate': _to_datetime(start),
             'EndDate': _to_datetime(end),
             'RunName': run_name,
             'WriteNetcdfFormat': False,
         }
+        if network is not None:
+            # Distributed: one land HRU per subbasin + channel routing. All HRUs read the
+            # single basin-mean gauge (spatially-uniform forcing; distributed routing +
+            # per-HRU areas/elevations). Per-HRU gridded forcing is a later enhancement.
+            sub_basins, hrus, channels, _gauged = build_distributed_objects(rc, network, logger)
+            config_kwargs['SubBasins'] = sub_basins
+            config_kwargs['HRUs'] = hrus
+            if channels:
+                config_kwargs['ChannelProfile'] = channels
+            config_kwargs['Routing'] = str(
+                _cfg(config, 'RAVEN_ROUTING_METHOD', 'ROUTE_DIFFUSIVE_WAVE'))
+        else:
+            # Lumped: single generic land HRU (CanadianShield: organic + bedrock).
+            config_kwargs['HRUs'] = _build_hrus(emulators, hru, spec, logger)
+
         if spec['rain_snow_fraction']:
             config_kwargs['RainSnowFraction'] = spec['rain_snow_fraction']
         # PET override (e.g. CanadianShield: HARGREAVES_1985 -> OUDIN so no TEMP_MIN/MAX needed).
@@ -393,12 +422,19 @@ def build_and_run_emulator(
         config_model = emulator_cls(**config_kwargs)
 
         emulator = Emulator(config=config_model, workdir=str(output_dir), overwrite=True)
+        # Multi-basin Raven requires :AvgAnnualRunoff in the .rvp (CemaNeige snow init);
+        # RavenPy 0.21 has no field for it, so inject it into the just-written .rvp before
+        # running. Emulator.__init__ writes the .rv files and run() does not rewrite them,
+        # so this is the correct injection point.
+        if network is not None:
+            _inject_avg_annual_runoff(emulator, network.avg_annual_runoff_mm, logger)
         # run() has its own overwrite flag (defaults to False); without it RavenPy
         # refuses to re-run into a workdir that already holds outputs — which every
         # calibration iteration does, since the worker reuses one sim_dir per process.
         output = emulator.run(overwrite=True)
+        mode = f"distributed ({network.n_subbasins} subbasins)" if network else "lumped"
         logger.info(
-            f"Raven {model_template} run completed -> {output.path} "
+            f"Raven {model_template} {mode} run completed -> {output.path} "
             f"(hydrograph: {output.files.get('hydrograph')})")
         return True
     except Exception as e:  # noqa: BLE001 -- model execution resilience
@@ -560,6 +596,25 @@ def _write_forcing_netcdf(forcing_df: pd.DataFrame, hru: Dict[str, Any], out: Pa
     out.parent.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(out, engine='netcdf4', encoding=encoding)
     ds.close()
+
+
+def _inject_avg_annual_runoff(emulator: Any, value_mm: float, logger: logging.Logger) -> None:
+    """Append ``:AvgAnnualRunoff`` to the emulator's written ``.rvp`` (multi-basin requirement).
+
+    Raven errors out ("AVG_ANNUAL_RUNOFF should be supplied ... if more than one basin is
+    included") without it. RavenPy 0.21 exposes no config field for the command, so we patch
+    the ``.rvp`` after :class:`Emulator` has written it and before ``run()`` (which does not
+    rewrite the ``.rv`` files). Best-effort: a failure here just lets Raven raise its own
+    clear error.
+    """
+    try:
+        rvp = Path(emulator.workdir) / f"{emulator.modelname}.rvp"
+        if rvp.exists() and ':AvgAnnualRunoff' not in rvp.read_text():
+            with rvp.open('a') as fh:
+                fh.write(f"\n:AvgAnnualRunoff {float(value_mm):.4f}\n")
+            logger.debug(f"Injected :AvgAnnualRunoff {value_mm:.1f} mm/yr into {rvp.name}")
+    except Exception as e:  # noqa: BLE001 -- let Raven surface the missing-command error
+        logger.warning(f"Could not inject :AvgAnnualRunoff ({e})")
 
 
 def _to_datetime(value: Any):
