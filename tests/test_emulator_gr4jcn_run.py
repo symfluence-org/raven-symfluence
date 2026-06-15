@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026 SYMFLUENCE Team <dev@symfluence.org>
 
 """End-to-end GR4JCN integration test against the real RavenPy + raven binary.

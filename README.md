@@ -89,9 +89,10 @@ pytest                       # unit tests; integration tests need the raven bina
 
 ## License
 
-GPL-3.0-or-later. Raven is developed at the University of Waterloo; RavenPy is developed by
-Ouranos. This plugin is an independent integration and is not affiliated with or endorsed by
-either project.
+MIT (see [LICENSE](LICENSE)). Raven is developed at the University of Waterloo; RavenPy is
+developed by Ouranos; SYMFLUENCE is a separate project under its own license. This plugin is
+an independent integration and is not affiliated with or endorsed by any of them; install
+and use each under its own terms.
 
 ---
 Repo and code assistance from [Claude](https://claude.ai) (Anthropic).

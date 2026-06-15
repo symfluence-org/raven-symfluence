@@ -13,9 +13,14 @@ name = "raven-symfluence"
 dynamic = ["version"]
 description = "Raven hydrological modelling framework -- SYMFLUENCE plugin"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = { text = "MIT" }
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "SYMFLUENCE Team", email = "dev@symfluence.org" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
 
 # RavenPy generates the .rv* config files and orchestrates the raven-hydro binary.
 # It is imported lazily (inside methods) so the plugin registers without it installed.
