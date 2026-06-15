@@ -8,6 +8,15 @@ sources = ["src"]
 [tool.hatch.version]
 path = "src/raven_symfluence/_version.py"
 
+# The benchmark directory is dev/reproducibility material (it lives in the GitHub repo) and
+# its local config_*.yaml hold machine-specific absolute paths — keep the whole tree out of
+# the published sdist/wheel so nothing machine-specific ships to PyPI.
+[tool.hatch.build.targets.sdist]
+exclude = ["/benchmark", "/tests"]
+
+[tool.hatch.build.targets.wheel]
+exclude = ["/benchmark", "/tests"]
+
 [project]
 name = "raven-symfluence"
 dynamic = ["version"]
