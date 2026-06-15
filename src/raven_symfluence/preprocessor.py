@@ -97,6 +97,11 @@ class RavenPreProcessor(BaseModelPreProcessor):  # type: ignore[misc]
                 catchment_shapefile=self._catchment_shapefile(),
             )
             if ok:
+                # RavenPy writes the .rv* set into the emulator workdir (the sim dir),
+                # not the settings dir. Mirror them into settings/RAVEN so the
+                # documented contract holds and the generated config is inspectable
+                # there alongside the forcing NetCDF + raven_params.json sidecar.
+                self._mirror_rv_files(sim_dir)
                 self.logger.info(f"Raven .rv* files written to {self.setup_dir}")
             else:
                 self.logger.warning(
@@ -129,6 +134,28 @@ class RavenPreProcessor(BaseModelPreProcessor):  # type: ignore[misc]
         except Exception as e:  # noqa: BLE001 -- model execution resilience
             self.logger.debug(f"Could not resolve initial Raven parameters: {e}")
             return {}
+
+    def _mirror_rv_files(self, sim_dir) -> None:
+        """Copy the RavenPy-generated ``.rv*`` files from the run dir into settings/RAVEN.
+
+        RavenPy emits the ``.rvi/.rvp/.rvh/.rvt/.rvc/.rve`` set into the emulator
+        workdir; SYMFLUENCE's convention is that ``settings/<MODEL>`` holds the model
+        config. Copies (not symlinks) so the settings copy survives a cleaned sim dir.
+        """
+        import shutil
+        from pathlib import Path
+
+        sim_dir = Path(sim_dir)
+        rv_files = sorted(p for p in sim_dir.glob('*.rv*') if p.is_file())
+        if not rv_files:
+            self.logger.debug(f"No .rv* files found in {sim_dir} to mirror into settings")
+            return
+        self.setup_dir.mkdir(parents=True, exist_ok=True)
+        for src in rv_files:
+            try:
+                shutil.copy2(str(src), str(self.setup_dir / src.name))
+            except Exception as e:  # noqa: BLE001 -- best-effort mirror
+                self.logger.debug(f"Could not mirror {src.name} into settings: {e}")
 
     def _catchment_shapefile(self):
         """Resolve the catchment shapefile (used as the HRU-attribute fallback)."""

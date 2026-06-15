@@ -166,10 +166,20 @@ class RavenWorker(BaseWorker):
             return {'kge': self.penalty_score, 'error': str(e)}
 
     def _load_observations(self, project_dir: Path, domain_name: str):
-        """Load preprocessed streamflow observations (m3/s) as a pandas Series."""
-        import pandas as pd
+        """Load preprocessed streamflow observations (m3/s) as a pandas Series.
 
-        obs_file = (project_dir / 'observations' / 'streamflow' / 'preprocessed'
+        Resolves the preprocessed CSV through ``resolve_data_subdir`` so it works
+        whether observations live under ``data/observations/`` (the model-ready
+        layout) or the legacy ``observations/`` location — matching every other
+        SYMFLUENCE worker/evaluator (inmemory_worker, summa metrics, streamflow
+        evaluator). The previous hard-coded ``project_dir/observations`` path
+        silently returned None on any domain using the ``data/`` layout.
+        """
+        import pandas as pd
+        from symfluence.core.mixins.project import resolve_data_subdir
+
+        obs_file = (resolve_data_subdir(project_dir, 'observations')
+                    / 'streamflow' / 'preprocessed'
                     / f"{domain_name}_streamflow_processed.csv")
         if not obs_file.exists():
             return None

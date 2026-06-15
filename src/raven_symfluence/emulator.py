@@ -310,7 +310,10 @@ def build_and_run_emulator(
         )
 
         emulator = Emulator(config=config_model, workdir=str(output_dir), overwrite=True)
-        output = emulator.run()
+        # run() has its own overwrite flag (defaults to False); without it RavenPy
+        # refuses to re-run into a workdir that already holds outputs — which every
+        # calibration iteration does, since the worker reuses one sim_dir per process.
+        output = emulator.run(overwrite=True)
         logger.info(
             f"Raven {model_template} run completed -> {output.path} "
             f"(hydrograph: {output.files.get('hydrograph')})")
