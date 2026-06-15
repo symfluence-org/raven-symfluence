@@ -79,18 +79,41 @@ the multi-basin CAMELS set.
 
 All three engines were driven through the standard SYMFLUENCE workflow
 (`model_specific_preprocessing → run_model → postprocess_results → calibrate_model`) on
-one real lumped basin sharing a single model-ready store, then assembled with
-`--from-domain`. Short DDS budgets (15–20 iters — a smoke run, not publication-grade):
+one real lumped basin sharing a single byte-identical model-ready store, then assembled
+with `--from-domain`. All cold-started (DDS from each engine's default parameters):
 
-| Engine | KGE (calib) | **KGE (eval)** | NSE (eval) |
-|--------|------------:|---------------:|-----------:|
-| **Raven** (GR4JCN) | 0.792 | **0.700** | 0.589 |
-| **SUMMA** (v4.0.0) | 0.745 | **0.734** | 0.451 |
-| **FUSE**           | 0.420 | **0.493** | −0.053 |
+| Engine | DDS iters | start KGE | KGE (calib) | **KGE (eval)** | NSE (eval) |
+|--------|----------:|----------:|------------:|---------------:|-----------:|
+| **Raven** (GR4JCN, 6 params) | 20   | 0.70   | 0.792 | **0.700** | 0.589 |
+| **SUMMA** (v4.0.0)           | 20   | —      | 0.745 | **0.734** | 0.451 |
+| **FUSE** (13 params)         | 1000 | −0.151 | 0.613 | **0.665** | 0.291 |
 
 The point holds: feeding all three engines from the same model-agnostic store via the
 normal workflow yields a like-for-like comparison, and **the Raven wrap is fully
 competitive** (best NSE, second KGE) — driven entirely through SYMFLUENCE.
+
+### Why FUSE looks weakest here — and why it isn't a structural result
+
+An earlier smoke run scored FUSE at eval KGE 0.49 (21 iters). Digging in: on **this exact
+basin** (byte-identical forcing/obs/period — `precip` mean 1.823, `temp` −2.922,
+`q_obs` 1.392) a known-good FUSE run reaches **calib 0.874 / eval 0.87+** with the *same*
+13 parameters and the *same* 1001-iter DDS budget. The entire difference is the **DDS
+starting point**:
+
+- known-good run: DDS *starts* at KGE **0.449** → 0.874 (its `para_def.nc` had been
+  pre-optimised by a prior SCE-UA pass — `para_def.nc.bak_sce` is the receipt; a
+  **warm start**);
+- this benchmark: DDS *starts* at KGE **−0.151** from FUSE's **raw defaults**, which are
+  pathological on a snowmelt basin like Bow → 0.613 even at the full 1000 iters.
+
+DDS is a perturbation search around its seed, so a 0.6-KGE-worse start lands in a worse
+local basin regardless of budget. **FUSE is therefore not structurally weak on Bow and
+not under-iterated — it is starting-point sensitive in its 13-D space.** The honest
+cold-start number is 0.665; warm-started (or with a global pre-search / multi-start DDS)
+it matches the others. The fair-comparison fix for Phase-2: give every engine the same
+seeding policy (all cold from defaults, *or* all warm from a short global pre-search) —
+not a fixed iteration count, which silently favours low-dimensional structures like
+GR4JCN's 6 params.
 
 ## Status
 
@@ -105,8 +128,10 @@ competitive** (best NSE, second KGE) — driven entirely through SYMFLUENCE.
 
 ### What a publication-grade run still needs
 
-1. **Bigger DDS budgets** (500–2000+ iters with a proper spin-up/warmup hold-out — the
-   numbers above are a smoke run; FUSE's eval NSE is still negative).
+1. **A uniform seeding + budget policy across engines** — either all cold-start from
+   defaults or all warm-start from a short global pre-search (SCE-UA / multi-start),
+   with a per-engine budget scaled to parameter dimension rather than a flat iteration
+   count (a flat count favours GR4JCN's 6 params over FUSE's 13). See the FUSE note above.
 2. **Many basins** — a CAMELS-scale sweep across gauges/regimes, not one basin.
 3. **Performance** — cache the daily-aggregated forcing; Raven currently rebuilds forcing
    per DDS trial (~73 s/trial) and FUSE's hourly `.load()` is slow.
