@@ -28,8 +28,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# CemaNeige snow parameters tack onto the four GR4J parameters, in RavenPy order.
-GR4JCN_PARAM_ORDER: List[str] = ['X1', 'X2', 'X3', 'X4', 'CN1', 'CN2']
+# Positional parameter order for GR4JCN, matching ravenpy.config.emulators.gr4jcn.P
+# exactly (verified against RavenPy 0.21): GR4J_X1..GR4J_X4 then the two CemaNeige snow
+# parameters CEMANEIGE_X1 (avg annual snow, mm) and CEMANEIGE_X2 (melt coefficient).
+GR4JCN_PARAM_ORDER: List[str] = [
+    'GR4J_X1', 'GR4J_X2', 'GR4J_X3', 'GR4J_X4', 'CEMANEIGE_X1', 'CEMANEIGE_X2',
+]
 
 
 def _cfg(config: Any, key: str, default: Any = None) -> Any:
@@ -192,8 +196,9 @@ def params_to_vector(model_template: str, params: Dict[str, float],
     if template == 'GR4JCN':
         order = GR4JCN_PARAM_ORDER
     else:
-        # TODO(ravenpy): define the positional order for HBVEC/HMETS/MOHYSE against
-        #   the installed RavenPy emulator before enabling those templates.
+        # HBVEC/HMETS/MOHYSE positional orders are recorded in calibration.bounds
+        # (verified against RavenPy 0.21) but not yet wired through the runner; fall
+        # back to the bounds key order when those templates are enabled in a later phase.
         order = list(bounds.keys())
 
     vector: List[float] = []
@@ -229,13 +234,21 @@ def build_and_run_emulator(
 
     RavenPy is imported lazily so this module imports without it installed.
     """
-    # Lazy, isolated import — never at module top level.
+    # Lazy, isolated import — never at module top level. Importing ravenpy itself
+    # requires the raven binary to be discoverable; point RavenPy at the resolved
+    # binary (env var) before the import so it works regardless of PATH.
+    _ensure_raven_binary_env(config, logger)
     try:
         import ravenpy  # noqa: F401
         from ravenpy import Emulator
+        from ravenpy.config import commands as rc
         from ravenpy.config import emulators
     except ImportError as e:
         logger.error(f"RavenPy is not installed; cannot run Raven: {e}")
+        return False
+    except RuntimeError as e:
+        # ravenpy raises RuntimeError at import if the raven binary is missing.
+        logger.error(f"RavenPy could not locate the raven binary: {e}")
         return False
 
     domain_name = _cfg(config, 'DOMAIN_NAME', 'unknown')
@@ -264,37 +277,43 @@ def build_and_run_emulator(
         settings_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Persist the daily forcing to a NetCDF Raven/RavenPy can read.
+        # Persist the daily forcing to a CF-compliant NetCDF that RavenPy's
+        # Gauge.from_nc can introspect (CF names pr/tas, a station dimension, and
+        # lat/lon/elevation station coordinates).
         forcing_nc = settings_dir / f"{domain_name}_raven_forcing.nc"
         _write_forcing_netcdf(forcing_df, hru, forcing_nc)
 
-        # TODO(ravenpy): verify the emulator constructor signature against the installed
-        #   RavenPy version. The current RavenPy expects an HRU spec + a typed `params`
-        #   model (e.g. emulators.GR4JCN.Params) and CF-mapped `Gauge`/`ObservationData`.
-        #   The call below targets the documented high-level API; adjust HRU/Gauge wiring
-        #   (CemaNeigeGR4J HRU, RavenPy `rc` data assignment) to the pinned version.
         emulator_cls = _resolve_emulator_class(emulators, model_template, logger)
         if emulator_cls is None:
             return False
 
+        # Single lumped land HRU; hru_type lets RavenPy pick the LandHRU subclass.
         hru_spec = {
             'area': hru['area_km2'],
             'elevation': hru['elevation'],
             'latitude': hru['latitude'],
             'longitude': hru['longitude'],
+            'hru_type': 'land',
         }
+        gauge = _build_gauge(rc, forcing_nc, hru, logger)
+
+        # GR4JCN defaults to NetCDF output (WriteNetcdfFormat=True); force CSV so the
+        # postprocessor's Hydrographs.csv reader (read_raven_streamflow) finds its input.
         config_model = emulator_cls(
             params=param_vector,
             HRUs=[hru_spec],
-            StartDate=start,
-            EndDate=end,
+            Gauge=[gauge],
+            StartDate=_to_datetime(start),
+            EndDate=_to_datetime(end),
             RunName=run_name,
-            Gauge=_build_gauge(forcing_nc, hru, logger),
+            WriteNetcdfFormat=False,
         )
 
-        emulator = Emulator(config=config_model, workdir=str(output_dir))
-        emulator.run()
-        logger.info(f"Raven {model_template} run completed -> {output_dir}")
+        emulator = Emulator(config=config_model, workdir=str(output_dir), overwrite=True)
+        output = emulator.run()
+        logger.info(
+            f"Raven {model_template} run completed -> {output.path} "
+            f"(hydrograph: {output.files.get('hydrograph')})")
         return True
     except Exception as e:  # noqa: BLE001 -- model execution resilience
         logger.error(f"RavenPy emulator build/run failed: {e}")
@@ -318,42 +337,122 @@ def _resolve_emulator_class(emulators, model_template: str, logger: logging.Logg
     return cls
 
 
-def _build_gauge(forcing_nc: Path, hru: Dict[str, Any], logger: logging.Logger):
-    """Build the RavenPy Gauge/forcing-data spec from the written forcing NetCDF.
+def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any], logger: logging.Logger):
+    """Build a RavenPy ``Gauge`` from the written forcing NetCDF.
 
-    TODO(ravenpy): verify against the installed RavenPy — recent versions build gauges
-      via ``ravenpy.config.commands.Gauge.from_nc`` / ``rc`` data with explicit
-      CF-name -> Raven-forcing mappings (PRECIP, TEMP_AVE). Returned as a plain spec
-      here; wire it into the pinned RavenPy Gauge API.
+    Uses :meth:`ravenpy.config.commands.Gauge.from_nc` (the canonical RavenPy 0.21
+    recipe): the NetCDF carries CF-named variables (``pr`` for PRECIP, ``tas`` for
+    TEMP_AVE) plus station lat/lon/elevation coordinates, so RavenPy can emit the
+    ``:ReadFromNetCDF`` block for each forcing. ``station_idx`` is 1-based.
     """
-    return {
-        'forcing_file': str(forcing_nc),
-        'data_vars': {'PRECIP': 'PRECIP', 'TEMP_AVE': 'TEMP_AVE'},
-        'elevation': hru['elevation'],
-        'latitude': hru['latitude'],
-        'longitude': hru['longitude'],
-    }
+    gauge = rc.Gauge.from_nc(
+        str(forcing_nc),
+        data_type=['PRECIP', 'TEMP_AVE'],
+        station_idx=1,
+        # Elevation is supplied explicitly so the gauge always has a vertical datum
+        # even when the NetCDF elevation coordinate is not picked up via CF.
+        data_kwds={'ALL': {'elevation': float(hru['elevation'])}},
+    )
+    logger.debug(
+        f"Built Raven gauge from {forcing_nc.name}: "
+        f"lat={gauge.latitude}, lon={gauge.longitude}, elev={gauge.elevation}")
+    return gauge
 
 
 def _write_forcing_netcdf(forcing_df: pd.DataFrame, hru: Dict[str, Any], out: Path) -> None:
-    """Write the daily Raven forcing frame to a NetCDF with Raven-native variables/units."""
+    """Write the daily Raven forcing frame to a CF-compliant NetCDF for ``Gauge.from_nc``.
+
+    RavenPy's ``Gauge.from_nc`` introspects the file via cf_xarray, so the layout must be
+    CF-discoverable:
+      - variables named ``pr`` (precipitation_flux) and ``tas`` (air_temperature) with a
+        ``(time, station)`` shape — the station dimension is required for ``station_idx``;
+      - station coordinates ``lat``/``lon``/``elevation`` with CF standard names;
+      - the time coordinate is written with an explicit ``days since`` float64 encoding,
+        which Raven's NetCDF reader requires (a string/native datetime encoding triggers
+        "Attempt to convert between text & numbers").
+
+    Units are carried through to Raven: precip mm/d, temperature degC.
+    """
     import xarray as xr
 
     time = pd.to_datetime(forcing_df.index)
+    precip = forcing_df['PRECIP'].astype(np.float32).values[:, None]
+    temp = forcing_df['TEMP_AVE'].astype(np.float32).values[:, None]
+    lat = float(hru['latitude'])
+    lon = float(hru['longitude'])
+    elev = float(hru['elevation'])
+
     ds = xr.Dataset(
         {
-            'PRECIP': ('time', forcing_df['PRECIP'].astype(np.float32).values),
-            'TEMP_AVE': ('time', forcing_df['TEMP_AVE'].astype(np.float32).values),
+            'pr': (('time', 'station'), precip,
+                   {'units': 'mm/d', 'standard_name': 'precipitation_flux',
+                    'long_name': 'daily precipitation'}),
+            'tas': (('time', 'station'), temp,
+                    {'units': 'degC', 'standard_name': 'air_temperature',
+                     'long_name': 'daily mean air temperature'}),
         },
-        coords={'time': time},
+        coords={
+            'time': time,
+            'lat': (('station',), [lat],
+                    {'units': 'degrees_north', 'standard_name': 'latitude'}),
+            'lon': (('station',), [lon],
+                    {'units': 'degrees_east', 'standard_name': 'longitude'}),
+            'elevation': (('station',), [elev],
+                          {'units': 'm', 'standard_name': 'height',
+                           'positive': 'up', 'axis': 'Z'}),
+        },
     )
-    ds['PRECIP'].attrs = {'units': 'mm/d', 'long_name': 'daily precipitation'}
-    ds['TEMP_AVE'].attrs = {'units': 'degC', 'long_name': 'daily mean air temperature'}
-    ds.attrs['latitude'] = hru['latitude']
-    ds.attrs['longitude'] = hru['longitude']
-    ds.attrs['elevation'] = hru['elevation']
-    ds.to_netcdf(out)
+    encoding = {
+        'time': {
+            'units': 'days since 1900-01-01 00:00:00',
+            'calendar': 'proleptic_gregorian',
+            'dtype': 'float64',
+        }
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(out, engine='netcdf4', encoding=encoding)
     ds.close()
+
+
+def _to_datetime(value: Any):
+    """Coerce a date/datetime/str window bound to a ``datetime.datetime`` for RavenPy."""
+    import datetime as _dt
+
+    if isinstance(value, _dt.datetime):
+        return value
+    if isinstance(value, _dt.date):
+        return _dt.datetime(value.year, value.month, value.day)
+    return pd.to_datetime(value).to_pydatetime()
+
+
+def _ensure_raven_binary_env(config: Any, logger: logging.Logger) -> None:
+    """Make the raven binary discoverable to RavenPy via RAVENPY_RAVEN_BINARY_PATH.
+
+    RavenPy resolves the engine from ``RAVENPY_RAVEN_BINARY_PATH`` (else PATH) *at import
+    time*, so this must run before ``import ravenpy``. If the env var is already set (e.g.
+    by :class:`RavenRunner`) it is left untouched; otherwise we fall back to a config-
+    supplied path or ``shutil.which('raven')``.
+    """
+    import os
+    import shutil
+
+    if os.environ.get('RAVENPY_RAVEN_BINARY_PATH'):
+        return
+    candidate = _cfg(config, 'RAVEN_INSTALL_PATH') or _cfg(config, 'RAVEN_EXE')
+    resolved = None
+    if candidate:
+        p = Path(candidate)
+        if p.is_dir():
+            p = p / 'raven'
+        if p.exists():
+            resolved = str(p)
+    if resolved is None:
+        resolved = shutil.which('raven')
+    if resolved:
+        os.environ['RAVENPY_RAVEN_BINARY_PATH'] = resolved
+        logger.debug(f"Set RAVENPY_RAVEN_BINARY_PATH={resolved}")
+    else:
+        logger.debug("No raven binary resolved; relying on RavenPy's own discovery")
 
 
 def _resolve_time_window(config: Any, forcing_df: pd.DataFrame) -> Tuple[Any, Any]:

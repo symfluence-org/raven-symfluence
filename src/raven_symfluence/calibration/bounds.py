@@ -17,33 +17,43 @@ from __future__ import annotations
 from typing import Any, Dict
 
 # --- GR4JCN (CemaNeige GR4J) -------------------------------------------------------------------
-# X1: production store capacity (mm); X2: inter-catchment exchange (mm/d, can be negative);
-# X3: routing store capacity (mm); X4: unit-hydrograph time base (days);
-# CN1: CemaNeige snow cold-content factor; CN2: CemaNeige degree-day melt factor.
-# TODO(ravenpy): verify GR4JCN parameter ordering/names against the installed RavenPy
-#   (ravenpy.config.emulators.GR4JCN expects an ordered 6-tuple GR4J_X1..X4 + CEMANEIGE_X1/X2).
+# Parameter names/order match ravenpy.config.emulators.gr4jcn.P exactly (verified against
+# RavenPy 0.21): GR4J_X1, GR4J_X2, GR4J_X3, GR4J_X4, CEMANEIGE_X1, CEMANEIGE_X2.
+#   GR4J_X1: production store capacity (mm); GR4J_X2: inter-catchment exchange (mm/d, signed);
+#   GR4J_X3: routing store capacity (mm); GR4J_X4: unit-hydrograph time base (days);
+#   CEMANEIGE_X1: CemaNeige average annual snow (mm); CEMANEIGE_X2: CemaNeige melt coefficient.
 GR4JCN_BOUNDS: Dict[str, Dict[str, Any]] = {
-    'X1':  {'min': 10.0,  'max': 2000.0, 'transform': 'log'},     # production store capacity (mm)
-    'X2':  {'min': -15.0, 'max': 10.0,   'transform': 'linear'},  # exchange coefficient (mm/d)
-    'X3':  {'min': 1.0,   'max': 500.0,  'transform': 'log'},     # routing store capacity (mm)
-    'X4':  {'min': 0.5,   'max': 15.0,   'transform': 'linear'},  # UH time base (days)
-    'CN1': {'min': 0.0,   'max': 1.0,    'transform': 'linear'},  # CemaNeige cold-content factor
-    'CN2': {'min': 1.0,   'max': 30.0,   'transform': 'linear'},  # CemaNeige melt factor (mm/degC/d)
+    'GR4J_X1':      {'min': 0.01,  'max': 2.5,    'transform': 'linear'},  # production store (mm*1000)
+    'GR4J_X2':      {'min': -15.0, 'max': 10.0,   'transform': 'linear'},  # exchange coefficient (mm/d)
+    'GR4J_X3':      {'min': 10.0,  'max': 700.0,  'transform': 'linear'},  # routing store capacity (mm)
+    'GR4J_X4':      {'min': 0.5,   'max': 7.0,    'transform': 'linear'},  # UH time base (days)
+    'CEMANEIGE_X1': {'min': 0.0,   'max': 1000.0, 'transform': 'linear'},  # avg annual snow (mm)
+    'CEMANEIGE_X2': {'min': 0.0,   'max': 1.0,    'transform': 'linear'},  # melt coefficient
 }
 
 # --- HBVEC (HBV-EC, 21 parameters) -- stub for a later phase -----------------------------------
-# TODO(ravenpy): populate the full HBVEC bounds + parameter ordering against
-#   ravenpy.config.emulators.HBVEC before enabling HBVEC calibration.
+# Parameter ordering verified against ravenpy.config.emulators.hbvec.P (RavenPy 0.21):
+#   X01..X21 (21 ordered slots). Bounds intentionally unpopulated: GR4JCN is the only
+#   Phase 1 template wired through the runner; fill these in when enabling HBVEC calibration.
+HBVEC_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 22)]
 HBVEC_BOUNDS: Dict[str, Dict[str, Any]] = {}
 
 # --- HMETS (21 parameters) -- stub for a later phase ------------------------------------------
-# TODO(ravenpy): populate the full HMETS bounds + parameter ordering against
-#   ravenpy.config.emulators.HMETS before enabling HMETS calibration.
+# Parameter ordering verified against ravenpy.config.emulators.hmets.P (RavenPy 0.21).
+# Bounds intentionally unpopulated (Phase 1 = GR4JCN only).
+HMETS_PARAM_ORDER = [
+    'GAMMA_SHAPE', 'GAMMA_SCALE', 'GAMMA_SHAPE2', 'GAMMA_SCALE2', 'MIN_MELT_FACTOR',
+    'MAX_MELT_FACTOR', 'DD_MELT_TEMP', 'DD_AGGRADATION', 'SNOW_SWI_MIN', 'SNOW_SWI_MAX',
+    'SWI_REDUCT_COEFF', 'DD_REFREEZE_TEMP', 'REFREEZE_FACTOR', 'REFREEZE_EXP',
+    'PET_CORRECTION', 'HMETS_RUNOFF_COEFF', 'PERC_COEFF', 'BASEFLOW_COEFF_1',
+    'BASEFLOW_COEFF_2', 'TOPSOIL', 'PHREATIC',
+]
 HMETS_BOUNDS: Dict[str, Dict[str, Any]] = {}
 
 # --- MOHYSE (10 parameters) -- stub for a later phase -----------------------------------------
-# TODO(ravenpy): populate the full MOHYSE bounds + parameter ordering against
-#   ravenpy.config.emulators.MOHYSE before enabling MOHYSE calibration.
+# Parameter ordering verified against ravenpy.config.emulators.mohyse.P (RavenPy 0.21):
+#   X01..X10. Bounds intentionally unpopulated (Phase 1 = GR4JCN only).
+MOHYSE_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 11)]
 MOHYSE_BOUNDS: Dict[str, Dict[str, Any]] = {}
 
 # Registry of per-template bounds, keyed by the canonical RAVEN_MODEL_TEMPLATE value.

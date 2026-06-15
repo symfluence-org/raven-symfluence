@@ -4,8 +4,9 @@
 """Raven Parameter Manager.
 
 Calibrates the scalar parameters of a Raven emulator structure (Phase 1: the six
-GR4JCN parameters X1..X4 + CemaNeige CN1/CN2). The package owns its parameter
-bounds (see :mod:`.bounds`), matching the dRoute/JAX-model plugin pattern.
+GR4JCN parameters GR4J_X1..GR4J_X4 + CEMANEIGE_X1/CEMANEIGE_X2, matching
+ravenpy.config.emulators.gr4jcn.P). The package owns its parameter bounds
+(see :mod:`.bounds`), matching the dRoute/JAX-model plugin pattern.
 
 Parameters are applied in-memory: RavenPy regenerates the ``.rvp`` (and the rest
 of the ``.rv*`` set) from the parameter vector each iteration, so

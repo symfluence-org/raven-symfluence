@@ -33,3 +33,8 @@ dev = ["pytest>=7.0", "ruff", "mypy"]
 
 [project.entry-points."symfluence.plugins"]
 raven = "raven_symfluence:register"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: end-to-end tests that run the real raven binary via RavenPy",
+]

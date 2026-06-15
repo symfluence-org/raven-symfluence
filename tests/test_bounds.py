@@ -9,7 +9,9 @@ def test_gr4jcn_bounds_wellformed():
     from raven_symfluence.calibration.bounds import get_raven_bounds
 
     bounds = get_raven_bounds("GR4JCN")
-    assert {"X1", "X2", "X3", "X4"} <= set(bounds)
+    # Names/order match ravenpy.config.emulators.gr4jcn.P exactly.
+    assert {"GR4J_X1", "GR4J_X2", "GR4J_X3", "GR4J_X4",
+            "CEMANEIGE_X1", "CEMANEIGE_X2"} == set(bounds)
     for name, spec in bounds.items():
         assert spec["min"] < spec["max"], f"{name}: min !< max"
         assert spec.get("transform", "linear") in ("linear", "log")
