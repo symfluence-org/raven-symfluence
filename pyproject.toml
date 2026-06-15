@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+sources = ["src"]
+
+[tool.hatch.version]
+path = "src/raven_symfluence/_version.py"
+
+[project]
+name = "raven-symfluence"
+dynamic = ["version"]
+description = "Raven hydrological modelling framework -- SYMFLUENCE plugin"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.11"
+authors = [{ name = "SYMFLUENCE Team", email = "dev@symfluence.org" }]
+
+# RavenPy generates the .rv* config files and orchestrates the raven-hydro binary.
+# It is imported lazily (inside methods) so the plugin registers without it installed.
+dependencies = [
+    "symfluence>=0.9.1",
+    "numpy",
+    "pandas",
+    "xarray",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+raven = ["ravenpy>=0.18"]
+dev = ["pytest>=7.0", "ruff", "mypy"]
+
+[project.entry-points."symfluence.plugins"]
+raven = "raven_symfluence:register"

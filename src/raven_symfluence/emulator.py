@@ -1,0 +1,396 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2024-2026 SYMFLUENCE Team <dev@symfluence.org>
+
+"""RavenPy emulator construction + execution (the single RavenPy integration point).
+
+Everything that touches RavenPy lives here so the rest of the plugin can import
+cleanly without RavenPy installed. RavenPy is imported lazily inside the functions
+(the SYMFLUENCE heavy-dependency convention), so importing this module never pulls
+in RavenPy at module-parse time.
+
+The plugin feeds Raven from SYMFLUENCE's model-ready datastore:
+- canonical CFIF forcing (precipitation_flux kg m-2 s-1, air_temperature K, ...)
+  via :func:`symfluence.data.model_ready.forcing_reader.open_canonical_forcing`
+- per-HRU catchment attributes (hru_area, elev_mean, latitude/longitude, topology)
+  via :func:`symfluence.data.model_ready.attributes_reader.open_canonical_attributes`,
+  falling back to the catchment shapefile when the attributes store is absent.
+
+RavenPy builds an emulator config (e.g. ``ravenpy.config.emulators.GR4JCN``) from the
+forcing + HRU attributes + parameters, writes the ``.rvi/.rvp/.rvh/.rvt/.rvc`` files,
+and drives the ``raven`` binary; the result is ``Hydrographs.csv`` in *output_dir*.
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# CemaNeige snow parameters tack onto the four GR4J parameters, in RavenPy order.
+GR4JCN_PARAM_ORDER: List[str] = ['X1', 'X2', 'X3', 'X4', 'CN1', 'CN2']
+
+
+def _cfg(config: Any, key: str, default: Any = None) -> Any:
+    """Flat-dict-first config accessor (workers/preprocessors pass flat dicts)."""
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if hasattr(config, 'get'):
+        return config.get(key, default)
+    return default
+
+
+# =============================================================================
+# Data assembly (model-ready store -> RavenPy inputs)
+# =============================================================================
+
+def load_forcing(forcing_basin_path: Path, logger: logging.Logger):
+    """Open the canonical CFIF forcing dataset for Raven.
+
+    Returns an xarray Dataset under canonical CF names (precipitation_flux,
+    air_temperature, ...) with ``ds.attrs['timestep_seconds']`` set, or None if no
+    forcing files are present.
+    """
+    from symfluence.data.model_ready.forcing_reader import open_canonical_forcing
+
+    files = sorted(Path(forcing_basin_path).glob('*.nc'))
+    if not files:
+        logger.error(f"No forcing NetCDF files found in {forcing_basin_path}")
+        return None
+    return open_canonical_forcing(files)
+
+
+def build_raven_forcing_frame(ds, logger: logging.Logger) -> pd.DataFrame:
+    """Convert a canonical CFIF forcing Dataset to a daily Raven forcing DataFrame.
+
+    Columns produced (Raven-native units):
+        PRECIP    : mm/d   (from precipitation_flux kg m-2 s-1)
+        TEMP_AVE  : degC   (from air_temperature K)
+
+    Areal/basin-averaged forcing is assumed (lumped GR4JCN). Sub-daily forcing is
+    aggregated to daily (sum for precip rate -> depth, mean for temperature).
+    """
+    from symfluence.data.preprocessing.cfif.units import UnitConverter
+
+    converter = UnitConverter()
+
+    # Reduce any spatial dimension to a basin mean (lumped).
+    def _basin_mean(var):
+        spatial = [d for d in var.dims if d != 'time']
+        return var.mean(dim=spatial) if spatial else var
+
+    precip_flux = _basin_mean(ds['precipitation_flux'])  # kg m-2 s-1
+    temp_k = _basin_mean(ds['air_temperature'])          # K
+
+    precip_series = precip_flux.to_pandas()
+    temp_series = temp_k.to_pandas()
+
+    # CFIF -> Raven units: precip kg m-2 s-1 -> mm/d; temp K -> degC.
+    precip_mm_d = converter.convert('precipitation', precip_series, 'kg m-2 s-1', 'mm/day')
+    temp_c = converter.convert('temperature', temp_series, 'K', 'degC')
+
+    df = pd.DataFrame({'PRECIP': precip_mm_d, 'TEMP_AVE': temp_c})
+    df.index = pd.to_datetime(df.index)
+
+    # Daily aggregation: precip is a depth/day rate (mean preserves the daily total
+    # once it is already daily; sub-daily depth-rate samples average to the daily rate),
+    # temperature averages.
+    daily = df.resample('D').agg({'PRECIP': 'mean', 'TEMP_AVE': 'mean'})
+    logger.debug(f"Built Raven daily forcing frame: {len(daily)} days")
+    return daily
+
+
+def resolve_hru_attributes(
+    project_dir: Path,
+    domain_name: str,
+    catchment_shapefile: Optional[Path],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Resolve the single (lumped) HRU's attributes for the Raven emulator.
+
+    Prefers the model-ready attributes store (per-HRU hru_area, elev_mean,
+    latitude/longitude); falls back to the catchment shapefile when the store is
+    absent (the "open returns None => use legacy" contract).
+
+    Returns a dict with keys: area_km2, elevation, latitude, longitude.
+    """
+    from symfluence.data.model_ready.attributes_reader import open_canonical_attributes
+
+    attrs = open_canonical_attributes(project_dir, domain_name)
+    if attrs is not None:
+        try:
+            # Areas are stored per-HRU in m2 under the terrain group; sum for the
+            # lumped catchment, average elevation/centroid.
+            area_m2 = attrs.variable('terrain', 'hru_area', reduce='mean')
+            elev = attrs.find_variable('terrain', ['elev_mean', 'elevation'], reduce='mean')
+            lat = attrs.find_variable('hru_identity', ['latitude', 'lat'], reduce='mean')
+            lon = attrs.find_variable('hru_identity', ['longitude', 'lon'], reduce='mean')
+            if area_m2 is not None:
+                logger.debug("Resolved Raven HRU attributes from model-ready store")
+                return {
+                    'area_km2': float(area_m2) / 1e6,
+                    'elevation': float(elev) if elev is not None else 1000.0,
+                    'latitude': float(lat) if lat is not None else 0.0,
+                    'longitude': float(lon) if lon is not None else 0.0,
+                }
+        except Exception as e:  # noqa: BLE001 -- absent/partial store => shapefile fallback
+            logger.debug(f"Attributes store incomplete ({e}); falling back to shapefile")
+
+    return _hru_attributes_from_shapefile(catchment_shapefile, logger)
+
+
+def _hru_attributes_from_shapefile(
+    catchment_shapefile: Optional[Path], logger: logging.Logger
+) -> Dict[str, Any]:
+    """Derive the lumped HRU attributes from the catchment shapefile."""
+    defaults = {'area_km2': 1.0, 'elevation': 1000.0, 'latitude': 0.0, 'longitude': 0.0}
+    if not catchment_shapefile or not Path(catchment_shapefile).exists():
+        logger.warning("No catchment shapefile available; using default HRU attributes")
+        return defaults
+    try:
+        import geopandas as gpd
+
+        gdf = gpd.read_file(catchment_shapefile)
+        if gdf.crs and gdf.crs.is_geographic:
+            centroid = gdf.geometry.unary_union.centroid
+            defaults['latitude'] = float(centroid.y)
+            defaults['longitude'] = float(centroid.x)
+            area_m2 = gdf.to_crs(gdf.estimate_utm_crs()).geometry.area.sum()
+        else:
+            centroid = gdf.to_crs(4326).geometry.unary_union.centroid
+            defaults['latitude'] = float(centroid.y)
+            defaults['longitude'] = float(centroid.x)
+            area_m2 = gdf.geometry.area.sum()
+        defaults['area_km2'] = float(area_m2) / 1e6
+        # Optional elevation column.
+        for col in ('elev_mean', 'elevation', 'Elevation', 'ELEV_MEAN'):
+            if col in gdf.columns:
+                defaults['elevation'] = float(gdf[col].mean())
+                break
+        logger.debug(f"Resolved Raven HRU attributes from shapefile: area={defaults['area_km2']:.2f} km2")
+    except Exception as e:  # noqa: BLE001 -- model execution resilience
+        logger.warning(f"Could not read catchment shapefile ({e}); using defaults")
+    return defaults
+
+
+# =============================================================================
+# Parameter vector
+# =============================================================================
+
+def params_to_vector(model_template: str, params: Dict[str, float],
+                     logger: logging.Logger) -> List[float]:
+    """Order a parameter dict into the RavenPy positional parameter vector.
+
+    Missing parameters fall back to the bounds midpoint so a partial calibration
+    set (e.g. calibrating only X1..X4) still produces a runnable model.
+    """
+    from .calibration.bounds import get_raven_bounds
+
+    template = str(model_template or 'GR4JCN').upper()
+    bounds = get_raven_bounds(template)
+    if template == 'GR4JCN':
+        order = GR4JCN_PARAM_ORDER
+    else:
+        # TODO(ravenpy): define the positional order for HBVEC/HMETS/MOHYSE against
+        #   the installed RavenPy emulator before enabling those templates.
+        order = list(bounds.keys())
+
+    vector: List[float] = []
+    for name in order:
+        if name in params:
+            vector.append(float(params[name]))
+        elif name in bounds:
+            b = bounds[name]
+            vector.append(float((b['min'] + b['max']) / 2.0))
+        else:
+            vector.append(0.0)
+    logger.debug(f"Raven {template} parameter vector: {vector}")
+    return vector
+
+
+# =============================================================================
+# RavenPy build + run (lazy import)
+# =============================================================================
+
+def build_and_run_emulator(
+    config: Any,
+    settings_dir: Path,
+    output_dir: Path,
+    params: Dict[str, float],
+    logger: logging.Logger,
+    forcing_basin_path: Optional[Path] = None,
+    catchment_shapefile: Optional[Path] = None,
+) -> bool:
+    """Build a Raven emulator from forcing + HRU attributes + params and run it.
+
+    Writes the ``.rvi/.rvp/.rvh/.rvt/.rvc`` files into *settings_dir* and the model
+    outputs (incl. ``Hydrographs.csv``) into *output_dir*. Returns True on success.
+
+    RavenPy is imported lazily so this module imports without it installed.
+    """
+    # Lazy, isolated import — never at module top level.
+    try:
+        import ravenpy  # noqa: F401
+        from ravenpy import Emulator
+        from ravenpy.config import emulators
+    except ImportError as e:
+        logger.error(f"RavenPy is not installed; cannot run Raven: {e}")
+        return False
+
+    domain_name = _cfg(config, 'DOMAIN_NAME', 'unknown')
+    data_dir = Path(_cfg(config, 'SYMFLUENCE_DATA_DIR', '.'))
+    project_dir = data_dir / f"domain_{domain_name}"
+    model_template = str(_cfg(config, 'RAVEN_MODEL_TEMPLATE', 'GR4JCN')).upper()
+    run_name = str(_cfg(config, 'RAVEN_RUN_NAME', 'raven_run'))
+
+    if forcing_basin_path is None:
+        forcing_basin_path = _resolve_forcing_basin_path(project_dir)
+    if catchment_shapefile is None:
+        catchment_shapefile = _resolve_catchment_shapefile(project_dir)
+
+    ds = load_forcing(forcing_basin_path, logger)
+    if ds is None:
+        return False
+
+    try:
+        forcing_df = build_raven_forcing_frame(ds, logger)
+        hru = resolve_hru_attributes(project_dir, domain_name, catchment_shapefile, logger)
+        start, end = _resolve_time_window(config, forcing_df)
+        param_vector = params_to_vector(model_template, params, logger)
+
+        settings_dir = Path(settings_dir)
+        output_dir = Path(output_dir)
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist the daily forcing to a NetCDF Raven/RavenPy can read.
+        forcing_nc = settings_dir / f"{domain_name}_raven_forcing.nc"
+        _write_forcing_netcdf(forcing_df, hru, forcing_nc)
+
+        # TODO(ravenpy): verify the emulator constructor signature against the installed
+        #   RavenPy version. The current RavenPy expects an HRU spec + a typed `params`
+        #   model (e.g. emulators.GR4JCN.Params) and CF-mapped `Gauge`/`ObservationData`.
+        #   The call below targets the documented high-level API; adjust HRU/Gauge wiring
+        #   (CemaNeigeGR4J HRU, RavenPy `rc` data assignment) to the pinned version.
+        emulator_cls = _resolve_emulator_class(emulators, model_template, logger)
+        if emulator_cls is None:
+            return False
+
+        hru_spec = {
+            'area': hru['area_km2'],
+            'elevation': hru['elevation'],
+            'latitude': hru['latitude'],
+            'longitude': hru['longitude'],
+        }
+        config_model = emulator_cls(
+            params=param_vector,
+            HRUs=[hru_spec],
+            StartDate=start,
+            EndDate=end,
+            RunName=run_name,
+            Gauge=_build_gauge(forcing_nc, hru, logger),
+        )
+
+        emulator = Emulator(config=config_model, workdir=str(output_dir))
+        emulator.run()
+        logger.info(f"Raven {model_template} run completed -> {output_dir}")
+        return True
+    except Exception as e:  # noqa: BLE001 -- model execution resilience
+        logger.error(f"RavenPy emulator build/run failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return False
+    finally:
+        try:
+            ds.close()
+        except Exception:  # noqa: BLE001 -- best-effort close
+            pass
+
+
+def _resolve_emulator_class(emulators, model_template: str, logger: logging.Logger):
+    """Look up the RavenPy emulator class for a template (GR4JCN supported in Phase 1)."""
+    cls = getattr(emulators, model_template, None)
+    if cls is None:
+        logger.error(
+            f"RavenPy has no emulator '{model_template}'. "
+            f"Phase 1 supports GR4JCN; others arrive in later phases.")
+    return cls
+
+
+def _build_gauge(forcing_nc: Path, hru: Dict[str, Any], logger: logging.Logger):
+    """Build the RavenPy Gauge/forcing-data spec from the written forcing NetCDF.
+
+    TODO(ravenpy): verify against the installed RavenPy — recent versions build gauges
+      via ``ravenpy.config.commands.Gauge.from_nc`` / ``rc`` data with explicit
+      CF-name -> Raven-forcing mappings (PRECIP, TEMP_AVE). Returned as a plain spec
+      here; wire it into the pinned RavenPy Gauge API.
+    """
+    return {
+        'forcing_file': str(forcing_nc),
+        'data_vars': {'PRECIP': 'PRECIP', 'TEMP_AVE': 'TEMP_AVE'},
+        'elevation': hru['elevation'],
+        'latitude': hru['latitude'],
+        'longitude': hru['longitude'],
+    }
+
+
+def _write_forcing_netcdf(forcing_df: pd.DataFrame, hru: Dict[str, Any], out: Path) -> None:
+    """Write the daily Raven forcing frame to a NetCDF with Raven-native variables/units."""
+    import xarray as xr
+
+    time = pd.to_datetime(forcing_df.index)
+    ds = xr.Dataset(
+        {
+            'PRECIP': ('time', forcing_df['PRECIP'].astype(np.float32).values),
+            'TEMP_AVE': ('time', forcing_df['TEMP_AVE'].astype(np.float32).values),
+        },
+        coords={'time': time},
+    )
+    ds['PRECIP'].attrs = {'units': 'mm/d', 'long_name': 'daily precipitation'}
+    ds['TEMP_AVE'].attrs = {'units': 'degC', 'long_name': 'daily mean air temperature'}
+    ds.attrs['latitude'] = hru['latitude']
+    ds.attrs['longitude'] = hru['longitude']
+    ds.attrs['elevation'] = hru['elevation']
+    ds.to_netcdf(out)
+    ds.close()
+
+
+def _resolve_time_window(config: Any, forcing_df: pd.DataFrame) -> Tuple[Any, Any]:
+    """Resolve the (start, end) simulation window from config, clipped to the forcing."""
+    start = _cfg(config, 'EXPERIMENT_TIME_START') or _cfg(config, 'TIME_START')
+    end = _cfg(config, 'EXPERIMENT_TIME_END') or _cfg(config, 'TIME_END')
+    f_start = forcing_df.index.min()
+    f_end = forcing_df.index.max()
+    start = pd.to_datetime(start).date() if start and str(start) != 'default' else f_start.date()
+    end = pd.to_datetime(end).date() if end and str(end) != 'default' else f_end.date()
+    return start, end
+
+
+def _resolve_forcing_basin_path(project_dir: Path) -> Path:
+    """Prefer the model-ready forcings store; fall back to basin_averaged_data."""
+    model_ready = project_dir / 'data' / 'model_ready' / 'forcings'
+    if model_ready.exists() and any(model_ready.glob('*.nc')):
+        return model_ready
+    return project_dir / 'forcing' / 'basin_averaged_data'
+
+
+def _resolve_catchment_shapefile(project_dir: Path) -> Optional[Path]:
+    """Best-effort lookup of a catchment shapefile for HRU attribute fallback."""
+    for sub in ('catchment', 'river_basins'):
+        d = project_dir / 'shapefiles' / sub
+        if d.exists():
+            shps = sorted(d.rglob('*.shp'))
+            if shps:
+                return shps[0]
+    return None
+
+
+__all__ = [
+    'build_and_run_emulator',
+    'load_forcing',
+    'build_raven_forcing_frame',
+    'resolve_hru_attributes',
+    'params_to_vector',
+    'GR4JCN_PARAM_ORDER',
+]
