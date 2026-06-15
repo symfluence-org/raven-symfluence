@@ -31,16 +31,26 @@ GR4JCN_BOUNDS: Dict[str, Dict[str, Any]] = {
     'CEMANEIGE_X2': {'min': 0.0,   'max': 1.0,    'transform': 'linear'},  # melt coefficient
 }
 
-# --- HBVEC (HBV-EC, 21 parameters) -- stub for a later phase -----------------------------------
-# Parameter ordering verified against ravenpy.config.emulators.hbvec.P (RavenPy 0.21):
-#   X01..X21 (21 ordered slots). Bounds intentionally unpopulated: GR4JCN is the only
-#   Phase 1 template wired through the runner; fill these in when enabling HBVEC calibration.
-HBVEC_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 22)]
-HBVEC_BOUNDS: Dict[str, Dict[str, Any]] = {}
+def _zip_bounds(order, low, high, transform: str = 'linear') -> Dict[str, Dict[str, Any]]:
+    """Build a {name: {min, max, transform}} dict from ordered low/high tuples."""
+    assert len(order) == len(low) == len(high), 'param order / low / high length mismatch'
+    return {name: {'min': float(lo), 'max': float(hi), 'transform': transform}
+            for name, lo, hi in zip(order, low, high)}
 
-# --- HMETS (21 parameters) -- stub for a later phase ------------------------------------------
-# Parameter ordering verified against ravenpy.config.emulators.hmets.P (RavenPy 0.21).
-# Bounds intentionally unpopulated (Phase 1 = GR4JCN only).
+
+# --- HBVEC (HBV-EC, 21 parameters) ------------------------------------------------------------
+# Order matches ravenpy.config.emulators.hbvec.P (X01..X21). Bounds are the canonical RavenPy
+# calibration ranges (RavenPy docs, notebook 06 — Calibration). Param ordering verified vs P.
+HBVEC_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 22)]
+HBVEC_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    HBVEC_PARAM_ORDER,
+    (-3.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.01, 0.05, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.05, 0.8, 0.8),
+    (3.0, 8.0, 8.0, 0.1, 1.0, 1.0, 7.0, 100.0, 1.0, 0.1, 6.0, 5.0, 5.0, 0.2, 1.0, 30.0, 3.0, 2.0, 1.0, 1.5, 1.5),
+)
+
+# --- HMETS (21 parameters) --------------------------------------------------------------------
+# Order matches ravenpy.config.emulators.hmets.P. Bounds = canonical RavenPy calibration ranges
+# (RavenPy docs, notebook 06; Martel et al. 2017). TOPSOIL/PHREATIC are in metres (RavenPy units).
 HMETS_PARAM_ORDER = [
     'GAMMA_SHAPE', 'GAMMA_SCALE', 'GAMMA_SHAPE2', 'GAMMA_SCALE2', 'MIN_MELT_FACTOR',
     'MAX_MELT_FACTOR', 'DD_MELT_TEMP', 'DD_AGGRADATION', 'SNOW_SWI_MIN', 'SNOW_SWI_MAX',
@@ -48,13 +58,20 @@ HMETS_PARAM_ORDER = [
     'PET_CORRECTION', 'HMETS_RUNOFF_COEFF', 'PERC_COEFF', 'BASEFLOW_COEFF_1',
     'BASEFLOW_COEFF_2', 'TOPSOIL', 'PHREATIC',
 ]
-HMETS_BOUNDS: Dict[str, Dict[str, Any]] = {}
+HMETS_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    HMETS_PARAM_ORDER,
+    (0.3, 0.01, 0.5, 0.15, 0.0, 0.0, -2.0, 0.01, 0.0, 0.01, 0.005, -5.0, 0.0, 0.0, 0.0, 0.0, 0.00001, 0.0, 0.00001, 0.0, 0.0),
+    (20.0, 5.0, 13.0, 1.5, 20.0, 20.0, 3.0, 0.2, 0.1, 0.3, 0.1, 2.0, 5.0, 1.0, 3.0, 1.0, 0.02, 0.1, 0.01, 0.5, 2.0),
+)
 
-# --- MOHYSE (10 parameters) -- stub for a later phase -----------------------------------------
-# Parameter ordering verified against ravenpy.config.emulators.mohyse.P (RavenPy 0.21):
-#   X01..X10. Bounds intentionally unpopulated (Phase 1 = GR4JCN only).
+# --- MOHYSE (10 parameters) -------------------------------------------------------------------
+# Order matches ravenpy.config.emulators.mohyse.P (X01..X10). Bounds = canonical RavenPy ranges.
 MOHYSE_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 11)]
-MOHYSE_BOUNDS: Dict[str, Dict[str, Any]] = {}
+MOHYSE_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    MOHYSE_PARAM_ORDER,
+    (0.01, 0.01, 0.01, -5.00, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01),
+    (20.0, 1.0, 20.0, 5.0, 0.5, 1.0, 1.0, 1.0, 15.0, 15.0),
+)
 
 # Registry of per-template bounds, keyed by the canonical RAVEN_MODEL_TEMPLATE value.
 RAVEN_TEMPLATE_BOUNDS: Dict[str, Dict[str, Dict[str, Any]]] = {
