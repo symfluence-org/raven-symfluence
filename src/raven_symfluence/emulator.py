@@ -408,6 +408,14 @@ def build_and_run_emulator(
                 config_kwargs['ChannelProfile'] = channels
             config_kwargs['Routing'] = str(
                 _cfg(config, 'RAVEN_ROUTING_METHOD', 'ROUTE_DIFFUSIVE_WAVE'))
+            # Regionalization: when on, the trial params are transfer-function coefficients;
+            # expand them into per-subbasin parameter multipliers and rebuild the global vector.
+            reg = _build_regionalization(config, network, params, rc, logger)
+            if reg is not None:
+                global_params, sbgroups, multipliers = reg
+                config_kwargs['params'] = params_to_vector(model_template, global_params, logger)
+                config_kwargs['SubBasinGroup'] = sbgroups
+                config_kwargs['SBGroupPropertyMultiplier'] = multipliers
         else:
             # Lumped: single generic land HRU (CanadianShield: organic + bedrock).
             config_kwargs['HRUs'] = _build_hrus(emulators, hru, spec, logger)
@@ -606,6 +614,69 @@ def _write_forcing_netcdf(forcing_df: pd.DataFrame, hru: Dict[str, Any], out: Pa
 # non-streamflow objectives the plugin supports. SNOW is snow water equivalent (SWE) in mm;
 # AET is actual evapotranspiration in mm/day.
 _CUSTOM_OUTPUT_VARS = {'SWE': 'SNOW', 'SNOW': 'SNOW', 'ET': 'AET', 'AET': 'AET'}
+
+
+def _build_regionalization(config: Any, network: Any, params: Dict[str, float],
+                           rc: Any, logger: logging.Logger):
+    """Expand transfer-function coefficients into per-subbasin Raven parameter multipliers.
+
+    Active only in distributed mode when ``PARAMETER_REGIONALIZATION`` is not 'lumped'. The
+    trial ``params`` are then transfer-function coefficients ({param}_a/{param}_b); we build
+    the per-subbasin attribute table, run the shared regionalization strategy to get a value
+    per subbasin for each regionalized parameter, set the emulator's global value to the mean
+    (so the param vector is well-defined), and express the spatial pattern as
+    ``SBGroupPropertyMultiplier`` factors (value_i / mean) over one subbasin group per
+    subbasin. Returns ``(global_params, subbasin_groups, multipliers)`` or ``None`` when
+    regionalization is off / not resolvable (caller uses the params as-is).
+    """
+    method = str(_cfg(config, 'PARAMETER_REGIONALIZATION', 'lumped')).lower()
+    if method == 'lumped':
+        return None
+    try:
+        from .calibration.bounds import get_raven_bounds
+        from .calibration.raven_regionalization import (
+            create_raven_regionalization,
+            load_raven_subbasin_attributes,
+        )
+
+        domain_name = _cfg(config, 'DOMAIN_NAME', 'unknown')
+        data_dir = Path(_cfg(config, 'SYMFLUENCE_DATA_DIR', '.'))
+        project_dir = data_dir / f"domain_{domain_name}"
+        template = str(_cfg(config, 'RAVEN_MODEL_TEMPLATE', 'GR4JCN')).upper()
+
+        attributes = load_raven_subbasin_attributes(project_dir, domain_name, network, logger)
+        strategy, resolved = create_raven_regionalization(
+            method=method, param_bounds=get_raven_bounds(template),
+            n_units=network.n_subbasins, attributes=attributes,
+            model_template=template, config=config if isinstance(config, dict) else None,
+            logger=logger)
+        if strategy is None or not resolved:
+            return None
+
+        values_array, names = strategy.to_distributed(params)  # [n_units, n_params]
+        global_params: Dict[str, float] = {k: float(v) for k, v in params.items()}
+        sbgroups: List[Any] = []
+        multipliers: List[Any] = []
+        for s in network.subbasins:
+            sbgroups.append(rc.SubBasinGroup(name=f"sb_{s.subbasin_id}",
+                                             sb_ids=[s.subbasin_id]))
+        for j, pname in enumerate(names):
+            col = [float(values_array[i, j]) for i in range(len(network.subbasins))]
+            mean = sum(col) / len(col) if col else 0.0
+            global_params[pname] = mean
+            if abs(mean) < 1e-9:
+                continue
+            for i, s in enumerate(network.subbasins):
+                mult = col[i] / mean
+                multipliers.append(rc.SBGroupPropertyMultiplier(
+                    group_name=f"sb_{s.subbasin_id}", parameter_name=pname, mult=mult))
+        logger.info(
+            f"Regionalization applied: {len(names)} params "
+            f"({', '.join(names)}) -> {len(multipliers)} per-subbasin multipliers")
+        return global_params, sbgroups, multipliers
+    except Exception as e:  # noqa: BLE001 -- fall back to global params on any failure
+        logger.warning(f"Regionalization expansion failed ({e}); using global params")
+        return None
 
 
 def _build_custom_outputs(config: Any, rc: Any, logger: logging.Logger) -> List[Any]:

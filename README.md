@@ -50,6 +50,26 @@ MULTI_GAUGE_OBS_DIR:   /path/to/obs                          # ID_<id>.csv per g
 Distributed mode falls back to lumped automatically for undelineated/single-subbasin
 domains. (CanadianShield needs two HRUs per subbasin and runs lumped only for now.)
 
+### Regionalization + multi-objective calibration
+
+In distributed mode, `PARAMETER_REGIONALIZATION: transfer_function` makes selected
+parameters vary **per subbasin** as a function of physical attributes
+(`param_i = a + b·attr_norm_i`). The optimizer then calibrates the transfer-function
+coefficients (a handful of numbers that generalise across the network) instead of one
+value per subbasin; values are applied per subbasin via Raven's `SBGroupPropertyMultiplier`.
+The default mapping (GR4JCN) regionalizes the production store on precipitation and the
+routing/snow stores on elevation; override with `RAVEN_REGIONALIZATION_PARAM_CONFIG`.
+
+Calibration can also target **SWE and ET** alongside streamflow. Raven emits the matching
+`:CustomOutput` (SNOW = SWE, AET) automatically, and the multi-objective framework combines
+them:
+
+```yaml
+RAVEN_SPATIAL_MODE: distributed
+PARAMETER_REGIONALIZATION: transfer_function
+OBJECTIVE_WEIGHTS: {STREAMFLOW: 0.7, SWE: 0.2, ET: 0.1}
+```
+
 See the SYMFLUENCE docs for the full configuration reference.
 
 ---

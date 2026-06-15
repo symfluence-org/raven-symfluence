@@ -50,16 +50,22 @@ class RavenParameterManager(BaseParameterManager):
         else:
             self._explicit_params = [p.strip() for p in str(params_str).split(',') if p.strip()]
 
+        # Regionalization (Phase 4): when on (+ distributed), the optimizer calibrates
+        # transfer-function coefficients instead of the raw regionalized parameters.
+        self._reg_initialized = False
+        self._reg_strategy: Any = None
+        self._reg_params: Dict[str, Any] = {}      # resolved {param: {attribute, ...}}
+        self._reg_coeff_bounds: Dict[str, tuple] = {}
+
     # ---- helpers ----------------------------------------------------------------------------
     def _get(self, default: Any, key: str) -> Any:
         return self._get_config_value(lambda: None, default=default, dict_key=key)
 
-    # ---- BaseParameterManager contract ------------------------------------------------------
-    def _get_parameter_names(self) -> List[str]:
+    # ---- Regionalization (Phase 4) ----------------------------------------------------------
+    def _raw_parameter_names(self) -> List[str]:
+        """The raw (non-regionalized) parameter set: explicit list or the full template set."""
         registry_bounds = get_raven_bounds(self.model_template)
         if self._explicit_params is not None:
-            # Honour the user's ordering; warn (not fail) on unknown names so registration
-            # stays resilient and the user sees the typo.
             for p in self._explicit_params:
                 if p not in registry_bounds:
                     self.logger.warning(
@@ -68,11 +74,65 @@ class RavenParameterManager(BaseParameterManager):
             return list(self._explicit_params)
         return list(registry_bounds.keys())
 
+    def _ensure_regionalization(self) -> None:
+        """Build the regionalization strategy once (distributed + non-lumped only)."""
+        if self._reg_initialized:
+            return
+        self._reg_initialized = True
+
+        method = str(self._get('lumped', 'PARAMETER_REGIONALIZATION')).lower()
+        spatial = str(self._get('lumped', 'RAVEN_SPATIAL_MODE')).lower()
+        if method == 'lumped' or spatial != 'distributed':
+            return
+        try:
+            from ..distributed import read_distributed_topology
+            from .raven_regionalization import (
+                create_raven_regionalization,
+                load_raven_subbasin_attributes,
+            )
+
+            domain = self._get('unknown', 'DOMAIN_NAME')
+            data_dir = Path(self._get('.', 'SYMFLUENCE_DATA_DIR'))
+            project_dir = data_dir / f"domain_{domain}"
+            network = read_distributed_topology(project_dir, domain, self.logger)
+            if network is None:
+                self.logger.info("Regionalization requested but no routable topology; "
+                                 "calibrating raw (global) parameters")
+                return
+            attributes = load_raven_subbasin_attributes(project_dir, domain, network, self.logger)
+            cfg = self.config if isinstance(self.config, dict) else None
+            strategy, resolved = create_raven_regionalization(
+                method=method, param_bounds=get_raven_bounds(self.model_template),
+                n_units=network.n_subbasins, attributes=attributes,
+                model_template=self.model_template, config=cfg, logger=self.logger)
+            if strategy is None or not resolved:
+                return
+            self._reg_strategy = strategy
+            self._reg_params = resolved
+            self._reg_coeff_bounds = strategy.get_calibration_parameters()
+        except Exception as e:  # noqa: BLE001 -- fall back to raw params on any failure
+            self.logger.warning(f"Regionalization init failed ({e}); calibrating raw params")
+
+    # ---- BaseParameterManager contract ------------------------------------------------------
+    def _get_parameter_names(self) -> List[str]:
+        self._ensure_regionalization()
+        if self._reg_strategy is not None:
+            # Calibrate transfer-function coefficients for regionalized params + raw bounds
+            # for the rest (parameters not regionalized stay global/scalar).
+            coeffs = list(self._reg_coeff_bounds.keys())
+            raw_kept = [p for p in self._raw_parameter_names() if p not in self._reg_params]
+            return coeffs + raw_kept
+        return self._raw_parameter_names()
+
     def _load_parameter_bounds(self) -> Dict[str, Dict[str, Any]]:
+        self._ensure_regionalization()
         registry_bounds = get_raven_bounds(self.model_template)
         bounds: Dict[str, Dict[str, Any]] = {}
         for param in self.all_param_names:
-            if param in registry_bounds:
+            if param in self._reg_coeff_bounds:
+                lo, hi = self._reg_coeff_bounds[param]
+                bounds[param] = {'min': float(lo), 'max': float(hi), 'transform': 'linear'}
+            elif param in registry_bounds:
                 bounds[param] = registry_bounds[param]
             else:
                 bounds[param] = {'min': 0.0, 'max': 1.0, 'transform': 'linear'}
