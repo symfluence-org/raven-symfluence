@@ -36,6 +36,51 @@ GR4JCN_PARAM_ORDER: List[str] = [
 ]
 
 
+# Per-template emulator metadata (verified against RavenPy 0.21 emulator classes).
+#
+# Each Raven emulator class (ravenpy.config.emulators.{GR4JCN,HBVEC,HMETS,Mohyse}) already
+# carries its own soil/vegetation/land-use classes, hydrologic processes, soil model, and PET
+# method. The plugin therefore only has to (a) name the right class, (b) order the parameter
+# vector, and (c) supply the *minimal extra inputs* each emulator's options imply for a single
+# lumped HRU driven by basin-mean PRECIP + TEMP_AVE:
+#
+#   class_name          : attribute name on ravenpy.config.emulators (Mohyse is not all-caps).
+#   rain_snow_fraction  : override for the emulator's RainSnowFraction option, or None to keep
+#                         the emulator default. HMETS and MOHYSE default to RAINSNOW_DATA, which
+#                         makes Raven *require* a separate snow time series; overriding to the
+#                         temperature-based RAINSNOW_DINGMAN (the same split GR4JCN uses) lets
+#                         Raven do the rain/snow partition internally from PRECIP + TEMP_AVE, so
+#                         no extra forcing is needed.
+#   needs_monthly_aves  : HBVEC uses PET_FROMMONTHLY + OROCORR_HBV, so each gauge must carry
+#                         :MonthlyAveTemperature and :MonthlyAveEvaporation (climatologies). We
+#                         attach a generic Northern-Hemisphere climatology to the gauge; this is
+#                         the canonical minimal HBVEC construction (RavenPy HBV example).
+#
+# All four are driven by PRECIP + TEMP_AVE only — no template needs TEMP_MIN/TEMP_MAX/PET or a
+# separate snow series with these option overrides.
+RAVEN_TEMPLATE_SPECS: Dict[str, Dict[str, Any]] = {
+    'GR4JCN': {'class_name': 'GR4JCN', 'rain_snow_fraction': None, 'needs_monthly_aves': False},
+    'HBVEC':  {'class_name': 'HBVEC',  'rain_snow_fraction': None, 'needs_monthly_aves': True},
+    'HMETS':  {'class_name': 'HMETS',  'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False},
+    'MOHYSE': {'class_name': 'Mohyse', 'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False},
+}
+
+# Generic Northern-Hemisphere monthly climatology (Jan..Dec) for HBVEC's PET_FROMMONTHLY /
+# OROCORR_HBV. Temperatures in degC, potential evaporation in mm/month. These are gauge-level
+# climatological inputs Raven requires for the from-monthly PET method; they are deliberately
+# generic (the gauge's actual sub-daily forcing still drives the water balance).
+HBVEC_MONTHLY_AVE_TEMPERATURE: List[float] = [-10.0, -8.0, -2.0, 5.0, 10.0, 15.0,
+                                              18.0, 16.0, 11.0, 5.0, -2.0, -8.0]
+HBVEC_MONTHLY_AVE_EVAPORATION: List[float] = [10.0, 15.0, 30.0, 55.0, 85.0, 100.0,
+                                              110.0, 95.0, 60.0, 35.0, 15.0, 8.0]
+
+
+def _resolve_template_spec(model_template: str) -> Dict[str, Any]:
+    """Return the emulator spec for a template, defaulting to GR4JCN for unknown names."""
+    return RAVEN_TEMPLATE_SPECS.get(str(model_template or 'GR4JCN').upper(),
+                                    RAVEN_TEMPLATE_SPECS['GR4JCN'])
+
+
 def _cfg(config: Any, key: str, default: Any = None) -> Any:
     """Flat-dict-first config accessor (workers/preprocessors pass flat dicts)."""
     if isinstance(config, dict):
@@ -193,13 +238,11 @@ def params_to_vector(model_template: str, params: Dict[str, float],
 
     template = str(model_template or 'GR4JCN').upper()
     bounds = get_raven_bounds(template)
-    if template == 'GR4JCN':
-        order = GR4JCN_PARAM_ORDER
-    else:
-        # HBVEC/HMETS/MOHYSE positional orders are recorded in calibration.bounds
-        # (verified against RavenPy 0.21) but not yet wired through the runner; fall
-        # back to the bounds key order when those templates are enabled in a later phase.
-        order = list(bounds.keys())
+    # The bounds dict for each template is declared in the exact positional order of that
+    # emulator's ``P`` dataclass (verified against RavenPy 0.21: GR4JCN GR4J_X1..CEMANEIGE_X2,
+    # HBVEC X01..X21, HMETS named, MOHYSE X01..X10), so the bounds key order *is* the RavenPy
+    # parameter-vector order. GR4JCN keeps its explicit constant for clarity / the fidelity test.
+    order = GR4JCN_PARAM_ORDER if template == 'GR4JCN' else list(bounds.keys())
 
     vector: List[float] = []
     for name in order:
@@ -283,11 +326,12 @@ def build_and_run_emulator(
         forcing_nc = settings_dir / f"{domain_name}_raven_forcing.nc"
         _write_forcing_netcdf(forcing_df, hru, forcing_nc)
 
+        spec = _resolve_template_spec(model_template)
         emulator_cls = _resolve_emulator_class(emulators, model_template, logger)
         if emulator_cls is None:
             return False
 
-        # Single lumped land HRU; hru_type lets RavenPy pick the LandHRU subclass.
+        # Single lumped land HRU; hru_type lets RavenPy pick the Land/Forest HRU subclass.
         hru_spec = {
             'area': hru['area_km2'],
             'elevation': hru['elevation'],
@@ -295,19 +339,25 @@ def build_and_run_emulator(
             'longitude': hru['longitude'],
             'hru_type': 'land',
         }
-        gauge = _build_gauge(rc, forcing_nc, hru, logger)
+        gauge = _build_gauge(rc, forcing_nc, hru, spec, logger)
 
         # GR4JCN defaults to NetCDF output (WriteNetcdfFormat=True); force CSV so the
         # postprocessor's Hydrographs.csv reader (read_raven_streamflow) finds its input.
-        config_model = emulator_cls(
-            params=param_vector,
-            HRUs=[hru_spec],
-            Gauge=[gauge],
-            StartDate=_to_datetime(start),
-            EndDate=_to_datetime(end),
-            RunName=run_name,
-            WriteNetcdfFormat=False,
-        )
+        # Templates whose default rain/snow split reads a separate snow series (HMETS/MOHYSE
+        # use RAINSNOW_DATA) are overridden to a temperature-based split so PRECIP + TEMP_AVE
+        # alone suffice (see RAVEN_TEMPLATE_SPECS).
+        config_kwargs: Dict[str, Any] = {
+            'params': param_vector,
+            'HRUs': [hru_spec],
+            'Gauge': [gauge],
+            'StartDate': _to_datetime(start),
+            'EndDate': _to_datetime(end),
+            'RunName': run_name,
+            'WriteNetcdfFormat': False,
+        }
+        if spec['rain_snow_fraction']:
+            config_kwargs['RainSnowFraction'] = spec['rain_snow_fraction']
+        config_model = emulator_cls(**config_kwargs)
 
         emulator = Emulator(config=config_model, workdir=str(output_dir), overwrite=True)
         # run() has its own overwrite flag (defaults to False); without it RavenPy
@@ -331,23 +381,48 @@ def build_and_run_emulator(
 
 
 def _resolve_emulator_class(emulators, model_template: str, logger: logging.Logger):
-    """Look up the RavenPy emulator class for a template (GR4JCN supported in Phase 1)."""
-    cls = getattr(emulators, model_template, None)
+    """Look up the RavenPy emulator class for a template.
+
+    Maps the SYMFLUENCE template name (always upper-case, e.g. ``MOHYSE``) to RavenPy's
+    actual class attribute (``Mohyse`` is not all-caps) via :data:`RAVEN_TEMPLATE_SPECS`.
+    Supports GR4JCN, HBVEC, HMETS, and MOHYSE.
+    """
+    spec = RAVEN_TEMPLATE_SPECS.get(str(model_template or '').upper())
+    class_name = spec['class_name'] if spec else str(model_template)
+    cls = getattr(emulators, class_name, None)
     if cls is None:
         logger.error(
-            f"RavenPy has no emulator '{model_template}'. "
-            f"Phase 1 supports GR4JCN; others arrive in later phases.")
+            f"RavenPy has no emulator '{class_name}' for template '{model_template}'. "
+            f"Supported templates: {', '.join(sorted(RAVEN_TEMPLATE_SPECS))}.")
     return cls
 
 
-def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any], logger: logging.Logger):
+def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any],
+                 spec: Optional[Dict[str, Any]] = None,
+                 logger: Optional[logging.Logger] = None):
     """Build a RavenPy ``Gauge`` from the written forcing NetCDF.
 
     Uses :meth:`ravenpy.config.commands.Gauge.from_nc` (the canonical RavenPy 0.21
     recipe): the NetCDF carries CF-named variables (``pr`` for PRECIP, ``tas`` for
     TEMP_AVE) plus station lat/lon/elevation coordinates, so RavenPy can emit the
     ``:ReadFromNetCDF`` block for each forcing. ``station_idx`` is 1-based.
+
+    For templates that need them (``spec['needs_monthly_aves']`` -> HBVEC, which uses
+    PET_FROMMONTHLY), the gauge is given monthly average temperature/evaporation
+    climatologies; Raven errors out without them.
+
+    ``spec`` defaults to the GR4JCN spec (no monthly aves). A logger passed positionally in
+    the legacy ``_build_gauge(rc, nc, hru, logger)`` form is tolerated for backward
+    compatibility.
     """
+    # Backward-compat: legacy callers passed the logger as the 4th positional argument.
+    if isinstance(spec, logging.Logger):
+        logger, spec = spec, None
+    if spec is None:
+        spec = RAVEN_TEMPLATE_SPECS['GR4JCN']
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     gauge = rc.Gauge.from_nc(
         str(forcing_nc),
         data_type=['PRECIP', 'TEMP_AVE'],
@@ -356,6 +431,10 @@ def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any], logger: logging.Logg
         # even when the NetCDF elevation coordinate is not picked up via CF.
         data_kwds={'ALL': {'elevation': float(hru['elevation'])}},
     )
+    if spec.get('needs_monthly_aves'):
+        gauge.monthly_ave_temperature = list(HBVEC_MONTHLY_AVE_TEMPERATURE)
+        gauge.monthly_ave_evaporation = list(HBVEC_MONTHLY_AVE_EVAPORATION)
+        logger.debug("Attached monthly ave temperature/evaporation climatology to gauge")
     logger.debug(
         f"Built Raven gauge from {forcing_nc.name}: "
         f"lat={gauge.latitude}, lon={gauge.longitude}, elev={gauge.elevation}")
@@ -495,4 +574,5 @@ __all__ = [
     'resolve_hru_attributes',
     'params_to_vector',
     'GR4JCN_PARAM_ORDER',
+    'RAVEN_TEMPLATE_SPECS',
 ]
