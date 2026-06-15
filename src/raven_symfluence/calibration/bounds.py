@@ -9,8 +9,11 @@ bounds rather than relying on the SYMFLUENCE shared bounds registry.
 Bounds are keyed by Raven emulator structure (``model_template``). Each entry is
 ``{'min': float, 'max': float, 'transform': 'linear'|'log'}``.
 
-Phase 1 fully specifies GR4JCN; HBVEC/HMETS/MOHYSE are provided as stubs with the
-canonical RavenPy parameter ordering so later phases can extend them in place.
+All eight hydrologic emulators are fully specified: GR4JCN, HBVEC, HMETS, MOHYSE,
+Blended, CanadianShield, HYPR, SACSMA. Parameter ordering is verified against each
+emulator's ``params`` dataclass in RavenPy 0.21; bounds are the canonical RavenPy
+calibration ranges from the official calibration notebook (RavenPy ``docs/notebooks/
+06_Raven_calibration.ipynb``, the "List of Model-Boundaries" section).
 """
 from __future__ import annotations
 
@@ -73,12 +76,69 @@ MOHYSE_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
     (20.0, 1.0, 20.0, 5.0, 0.5, 1.0, 1.0, 1.0, 15.0, 15.0),
 )
 
+# --- Blended (43 parameters) ------------------------------------------------------------------
+# Order matches ravenpy.config.emulators.blended.P (X01..X35 then R01..R08); verified vs the
+# params dataclass. Bounds = canonical RavenPy calibration ranges (notebook 06; Mai et al. 2020,
+# "blended model" structure-and-parameter calibration).
+BLENDED_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 36)] + [f'R{i:02d}' for i in range(1, 9)]
+BLENDED_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    BLENDED_PARAM_ORDER,
+    (0.0, 0.1, 0.5, -5.0, 0.0, 0.5, 5.0, 0.0, 0.0, 0.0, -5.0, 0.5, 0.0, 0.01, 0.005, -5.0, 0.0,
+     0.0, 0.0, 0.3, 0.01, 0.5, 0.15, 1.5, 0.0, -1.0, 0.01, 0.00001, 0.0, 0.0, -3.0, 0.5, 0.8, 0.8,
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    (1.0, 3.0, 3.0, -1.0, 100.0, 2.0, 10.0, 3.0, 0.05, 0.45, -2.0, 2.0, 0.1, 0.3, 0.1, 2.0, 1.0,
+     5.0, 0.4, 20.0, 5.0, 13.0, 1.5, 3.0, 5.0, 1.0, 0.2, 0.02, 0.5, 2.0, 3.0, 4.0, 1.2, 1.2,
+     0.02, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+)
+
+# --- CanadianShield (34 parameters) -----------------------------------------------------------
+# Order matches ravenpy.config.emulators.canadianshield.P (X01..X34); verified vs the params
+# dataclass. Bounds = canonical RavenPy calibration ranges (notebook 06).
+CANADIANSHIELD_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 35)]
+CANADIANSHIELD_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    CANADIANSHIELD_PARAM_ORDER,
+    (0.01, 0.01, 0.01, 0.0, 0.0, 0.05, 0.0, -5.0, -5.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01,
+     0.005, -3.0, 0.5, 5.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.8, 0.0),
+    (0.5, 2.0, 3.0, 3.0, 0.05, 0.45, 7.0, -1.0, -1.0, 2.0, 2.0, 100.0, 100.0, 100.0, 0.4, 0.1,
+     0.3, 0.1, 3.0, 4.0, 500.0, 5.0, 5.0, 1.0, 8.0, 20.0, 1.5, 0.2, 0.2, 10.0, 10.0, 1.2, 1.2, 1.0),
+)
+
+# --- HYPR (21 parameters) ---------------------------------------------------------------------
+# Order matches ravenpy.config.emulators.hypr.P (X01..X21); verified vs the params dataclass.
+# Bounds = canonical RavenPy calibration ranges (notebook 06).
+HYPR_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 22)]
+HYPR_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    HYPR_PARAM_ORDER,
+    (-1.0, -3.0, 0.0, 0.3, -1.3, -2.0, 0.0, 0.1, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0,
+     1.5, 0.0, 0.0, 0.8),
+    (1.0, 3.0, 0.8, 1.0, 0.3, 0.0, 30.0, 0.8, 2.0, 100.0, 0.5, 5.0, 1.0, 1000.0, 6.0, 7.0, 8.0,
+     3.0, 5.0, 5.0, 1.2),
+)
+
+# --- SACSMA (21 parameters) -------------------------------------------------------------------
+# Order matches ravenpy.config.emulators.sacsma.P (X01..X21); verified vs the params dataclass.
+# Bounds = canonical RavenPy calibration ranges (notebook 06). Several SAC-SMA parameters are
+# calibrated in log10 space (X01..X03 lows/highs are negative powers-of-ten exponents); these
+# bounds are reproduced verbatim from the RavenPy notebook.
+SACSMA_PARAM_ORDER = [f'X{i:02d}' for i in range(1, 22)]
+SACSMA_BOUNDS: Dict[str, Dict[str, Any]] = _zip_bounds(
+    SACSMA_PARAM_ORDER,
+    (-3.0, -1.52287874, -0.69897, 0.025, 0.01, 0.075, 0.015, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+     0.0, 0.0, 0.0, 0.3, 0.01, 0.8, 0.8),
+    (-1.82390874, -0.69897, -0.30102999, 0.125, 0.075, 0.3, 0.3, 0.6, 0.5, 3.0, 80.0, 0.8, 0.05,
+     0.2, 0.1, 0.4, 8.0, 20.0, 5.0, 1.2, 1.2),
+)
+
 # Registry of per-template bounds, keyed by the canonical RAVEN_MODEL_TEMPLATE value.
 RAVEN_TEMPLATE_BOUNDS: Dict[str, Dict[str, Dict[str, Any]]] = {
     'GR4JCN': GR4JCN_BOUNDS,
     'HBVEC':  HBVEC_BOUNDS,
     'HMETS':  HMETS_BOUNDS,
     'MOHYSE': MOHYSE_BOUNDS,
+    'BLENDED': BLENDED_BOUNDS,
+    'CANADIANSHIELD': CANADIANSHIELD_BOUNDS,
+    'HYPR': HYPR_BOUNDS,
+    'SACSMA': SACSMA_BOUNDS,
 }
 
 
@@ -86,7 +146,8 @@ def get_raven_bounds(model_template: str = 'GR4JCN') -> Dict[str, Dict[str, Any]
     """Return the package-owned calibration bounds for a Raven emulator structure.
 
     Args:
-        model_template: Raven emulator name (``GR4JCN``, ``HBVEC``, ``HMETS``, ``MOHYSE``).
+        model_template: Raven emulator name (``GR4JCN``, ``HBVEC``, ``HMETS``, ``MOHYSE``,
+            ``BLENDED``, ``CANADIANSHIELD``, ``HYPR``, ``SACSMA``).
 
     Returns:
         ``{param: {'min', 'max', 'transform'}}`` (a deep-ish copy so callers can

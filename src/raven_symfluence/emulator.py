@@ -51,28 +51,58 @@ GR4JCN_PARAM_ORDER: List[str] = [
 #                         temperature-based RAINSNOW_DINGMAN (the same split GR4JCN uses) lets
 #                         Raven do the rain/snow partition internally from PRECIP + TEMP_AVE, so
 #                         no extra forcing is needed.
-#   needs_monthly_aves  : HBVEC uses PET_FROMMONTHLY + OROCORR_HBV, so each gauge must carry
+#   needs_monthly_aves  : HBVEC/HYPR use PET_FROMMONTHLY, so each gauge must carry
 #                         :MonthlyAveTemperature and :MonthlyAveEvaporation (climatologies). We
 #                         attach a generic Northern-Hemisphere climatology to the gauge; this is
-#                         the canonical minimal HBVEC construction (RavenPy HBV example).
+#                         the canonical minimal construction (RavenPy HBV/HYPR examples).
+#   evaporation         : override for the emulator's Evaporation (PET) option, or None to keep
+#                         the emulator default. CanadianShield defaults to PET_HARGREAVES_1985,
+#                         which makes Raven *require* a daily temperature range (TEMP_MIN/TEMP_MAX).
+#                         Overriding to PET_OUDIN (temperature + latitude, the same PET GR4JCN and
+#                         Blended use) lets PRECIP + TEMP_AVE alone suffice. ``ow_evaporation`` is
+#                         True when the open-water PET option (OW_Evaporation) must match.
+#   hru_kind            : how the lumped HRU(s) are built. 'land' (default) -> one generic land
+#                         HRU. 'canadianshield' -> CanadianShield is validated to require exactly
+#                         two HRUs (one organic SOILP_ORG, one bedrock SOILP_BEDROCK); we build the
+#                         emulator's OrganicHRU + BedRockHRU, splitting the catchment area equally.
 #
-# All four are driven by PRECIP + TEMP_AVE only — no template needs TEMP_MIN/TEMP_MAX/PET or a
-# separate snow series with these option overrides.
+# Forcing: every spec is driven by PRECIP + TEMP_AVE only. No template needs TEMP_MIN/TEMP_MAX,
+# an explicit PET series, or a separate snow series under these option overrides (the rain/snow
+# split and PET are computed internally from temperature, and SACSMA's default RAINSNOW_DATA is
+# overridden to the temperature-based RAINSNOW_DINGMAN just like HMETS/MOHYSE).
 RAVEN_TEMPLATE_SPECS: Dict[str, Dict[str, Any]] = {
-    'GR4JCN': {'class_name': 'GR4JCN', 'rain_snow_fraction': None, 'needs_monthly_aves': False},
-    'HBVEC':  {'class_name': 'HBVEC',  'rain_snow_fraction': None, 'needs_monthly_aves': True},
-    'HMETS':  {'class_name': 'HMETS',  'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False},
-    'MOHYSE': {'class_name': 'Mohyse', 'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False},
+    'GR4JCN': {'class_name': 'GR4JCN', 'rain_snow_fraction': None, 'needs_monthly_aves': False,
+               'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'HBVEC':  {'class_name': 'HBVEC',  'rain_snow_fraction': None, 'needs_monthly_aves': True,
+               'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'HMETS':  {'class_name': 'HMETS',  'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False,
+               'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'MOHYSE': {'class_name': 'Mohyse', 'rain_snow_fraction': 'RAINSNOW_DINGMAN', 'needs_monthly_aves': False,
+               'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'BLENDED': {'class_name': 'Blended', 'rain_snow_fraction': None, 'needs_monthly_aves': False,
+                'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'CANADIANSHIELD': {'class_name': 'CanadianShield', 'rain_snow_fraction': None,
+                       'needs_monthly_aves': False, 'evaporation': 'PET_OUDIN',
+                       'ow_evaporation': True, 'hru_kind': 'canadianshield'},
+    'HYPR':   {'class_name': 'HYPR',   'rain_snow_fraction': None, 'needs_monthly_aves': True,
+               'evaporation': None, 'ow_evaporation': False, 'hru_kind': 'land'},
+    'SACSMA': {'class_name': 'SACSMA', 'rain_snow_fraction': 'RAINSNOW_DINGMAN',
+               'needs_monthly_aves': False, 'evaporation': None, 'ow_evaporation': False,
+               'hru_kind': 'land'},
 }
 
-# Generic Northern-Hemisphere monthly climatology (Jan..Dec) for HBVEC's PET_FROMMONTHLY /
-# OROCORR_HBV. Temperatures in degC, potential evaporation in mm/month. These are gauge-level
-# climatological inputs Raven requires for the from-monthly PET method; they are deliberately
-# generic (the gauge's actual sub-daily forcing still drives the water balance).
-HBVEC_MONTHLY_AVE_TEMPERATURE: List[float] = [-10.0, -8.0, -2.0, 5.0, 10.0, 15.0,
-                                              18.0, 16.0, 11.0, 5.0, -2.0, -8.0]
-HBVEC_MONTHLY_AVE_EVAPORATION: List[float] = [10.0, 15.0, 30.0, 55.0, 85.0, 100.0,
-                                              110.0, 95.0, 60.0, 35.0, 15.0, 8.0]
+# Generic Northern-Hemisphere monthly climatology (Jan..Dec) for the PET_FROMMONTHLY PET method
+# used by HBVEC and HYPR. Temperatures in degC, potential evaporation in mm/month. These are
+# gauge-level climatological inputs Raven requires for the from-monthly PET method; they are
+# deliberately generic (the gauge's actual sub-daily forcing still drives the water balance).
+MONTHLY_AVE_TEMPERATURE: List[float] = [-10.0, -8.0, -2.0, 5.0, 10.0, 15.0,
+                                        18.0, 16.0, 11.0, 5.0, -2.0, -8.0]
+MONTHLY_AVE_EVAPORATION: List[float] = [10.0, 15.0, 30.0, 55.0, 85.0, 100.0,
+                                        110.0, 95.0, 60.0, 35.0, 15.0, 8.0]
+
+# Backwards-compatible aliases (the constants were HBVEC-specific in earlier phases).
+HBVEC_MONTHLY_AVE_TEMPERATURE = MONTHLY_AVE_TEMPERATURE
+HBVEC_MONTHLY_AVE_EVAPORATION = MONTHLY_AVE_EVAPORATION
 
 
 def _resolve_template_spec(model_template: str) -> Dict[str, Any]:
@@ -239,8 +269,9 @@ def params_to_vector(model_template: str, params: Dict[str, float],
     template = str(model_template or 'GR4JCN').upper()
     bounds = get_raven_bounds(template)
     # The bounds dict for each template is declared in the exact positional order of that
-    # emulator's ``P`` dataclass (verified against RavenPy 0.21: GR4JCN GR4J_X1..CEMANEIGE_X2,
-    # HBVEC X01..X21, HMETS named, MOHYSE X01..X10), so the bounds key order *is* the RavenPy
+    # emulator's ``params`` dataclass (verified against RavenPy 0.21: GR4JCN GR4J_X1..CEMANEIGE_X2,
+    # HBVEC X01..X21, HMETS named, MOHYSE X01..X10, BLENDED X01..X35+R01..R08, CANADIANSHIELD
+    # X01..X34, HYPR X01..X21, SACSMA X01..X21), so the bounds key order *is* the RavenPy
     # parameter-vector order. GR4JCN keeps its explicit constant for clarity / the fidelity test.
     order = GR4JCN_PARAM_ORDER if template == 'GR4JCN' else list(bounds.keys())
 
@@ -331,24 +362,21 @@ def build_and_run_emulator(
         if emulator_cls is None:
             return False
 
-        # Single lumped land HRU; hru_type lets RavenPy pick the Land/Forest HRU subclass.
-        hru_spec = {
-            'area': hru['area_km2'],
-            'elevation': hru['elevation'],
-            'latitude': hru['latitude'],
-            'longitude': hru['longitude'],
-            'hru_type': 'land',
-        }
+        # HRU(s) for the lumped catchment. Most emulators take a single generic land HRU;
+        # CanadianShield is validated to require exactly two (organic + bedrock), so it gets a
+        # dedicated builder that splits the catchment area between its two HRU subclasses.
+        hru_list = _build_hrus(emulators, hru, spec, logger)
         gauge = _build_gauge(rc, forcing_nc, hru, spec, logger)
 
         # GR4JCN defaults to NetCDF output (WriteNetcdfFormat=True); force CSV so the
         # postprocessor's Hydrographs.csv reader (read_raven_streamflow) finds its input.
-        # Templates whose default rain/snow split reads a separate snow series (HMETS/MOHYSE
-        # use RAINSNOW_DATA) are overridden to a temperature-based split so PRECIP + TEMP_AVE
-        # alone suffice (see RAVEN_TEMPLATE_SPECS).
+        # Templates whose default rain/snow split reads a separate snow series (HMETS/MOHYSE/
+        # SACSMA use RAINSNOW_DATA) are overridden to a temperature-based split, and templates
+        # whose default PET needs a temperature range (CanadianShield -> HARGREAVES_1985) are
+        # overridden to PET_OUDIN, so PRECIP + TEMP_AVE alone suffice (see RAVEN_TEMPLATE_SPECS).
         config_kwargs: Dict[str, Any] = {
             'params': param_vector,
-            'HRUs': [hru_spec],
+            'HRUs': hru_list,
             'Gauge': [gauge],
             'StartDate': _to_datetime(start),
             'EndDate': _to_datetime(end),
@@ -357,6 +385,11 @@ def build_and_run_emulator(
         }
         if spec['rain_snow_fraction']:
             config_kwargs['RainSnowFraction'] = spec['rain_snow_fraction']
+        # PET override (e.g. CanadianShield: HARGREAVES_1985 -> OUDIN so no TEMP_MIN/MAX needed).
+        if spec.get('evaporation'):
+            config_kwargs['Evaporation'] = spec['evaporation']
+            if spec.get('ow_evaporation'):
+                config_kwargs['OW_Evaporation'] = spec['evaporation']
         config_model = emulator_cls(**config_kwargs)
 
         emulator = Emulator(config=config_model, workdir=str(output_dir), overwrite=True)
@@ -384,8 +417,9 @@ def _resolve_emulator_class(emulators, model_template: str, logger: logging.Logg
     """Look up the RavenPy emulator class for a template.
 
     Maps the SYMFLUENCE template name (always upper-case, e.g. ``MOHYSE``) to RavenPy's
-    actual class attribute (``Mohyse`` is not all-caps) via :data:`RAVEN_TEMPLATE_SPECS`.
-    Supports GR4JCN, HBVEC, HMETS, and MOHYSE.
+    actual class attribute (``Mohyse``/``Blended``/``CanadianShield`` are not all-caps) via
+    :data:`RAVEN_TEMPLATE_SPECS`. Supports all eight hydrologic emulators: GR4JCN, HBVEC, HMETS,
+    MOHYSE, BLENDED, CANADIANSHIELD, HYPR, SACSMA.
     """
     spec = RAVEN_TEMPLATE_SPECS.get(str(model_template or '').upper())
     class_name = spec['class_name'] if spec else str(model_template)
@@ -395,6 +429,38 @@ def _resolve_emulator_class(emulators, model_template: str, logger: logging.Logg
             f"RavenPy has no emulator '{class_name}' for template '{model_template}'. "
             f"Supported templates: {', '.join(sorted(RAVEN_TEMPLATE_SPECS))}.")
     return cls
+
+
+def _build_hrus(emulators, hru: Dict[str, Any], spec: Dict[str, Any],
+                logger: logging.Logger) -> List[Any]:
+    """Build the HRU list for an emulator from the resolved lumped catchment attributes.
+
+    Most emulators take a single generic land HRU (``hru_type='land'`` lets RavenPy pick the
+    Land/Forest HRU subclass). CanadianShield is validated by RavenPy to require *exactly two*
+    HRUs — one organic (``SOILP_ORG``) and one bedrock (``SOILP_BEDROCK``) — so for it we build
+    the emulator module's ``OrganicHRU`` + ``BedRockHRU`` and split the catchment area equally
+    between them (the two HRUs share the lumped centroid/elevation).
+    """
+    if spec.get('hru_kind') == 'canadianshield':
+        from ravenpy.config.emulators.canadianshield import BedRockHRU, OrganicHRU
+
+        half_area = float(hru['area_km2']) / 2.0
+        common = {
+            'area': half_area,
+            'elevation': float(hru['elevation']),
+            'latitude': float(hru['latitude']),
+            'longitude': float(hru['longitude']),
+        }
+        logger.debug("Built CanadianShield organic + bedrock HRUs (area split equally)")
+        return [OrganicHRU(**common), BedRockHRU(**common)]
+
+    return [{
+        'area': hru['area_km2'],
+        'elevation': hru['elevation'],
+        'latitude': hru['latitude'],
+        'longitude': hru['longitude'],
+        'hru_type': 'land',
+    }]
 
 
 def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any],
@@ -432,8 +498,8 @@ def _build_gauge(rc, forcing_nc: Path, hru: Dict[str, Any],
         data_kwds={'ALL': {'elevation': float(hru['elevation'])}},
     )
     if spec.get('needs_monthly_aves'):
-        gauge.monthly_ave_temperature = list(HBVEC_MONTHLY_AVE_TEMPERATURE)
-        gauge.monthly_ave_evaporation = list(HBVEC_MONTHLY_AVE_EVAPORATION)
+        gauge.monthly_ave_temperature = list(MONTHLY_AVE_TEMPERATURE)
+        gauge.monthly_ave_evaporation = list(MONTHLY_AVE_EVAPORATION)
         logger.debug("Attached monthly ave temperature/evaporation climatology to gauge")
     logger.debug(
         f"Built Raven gauge from {forcing_nc.name}: "
@@ -575,4 +641,6 @@ __all__ = [
     'params_to_vector',
     'GR4JCN_PARAM_ORDER',
     'RAVEN_TEMPLATE_SPECS',
+    'MONTHLY_AVE_TEMPERATURE',
+    'MONTHLY_AVE_EVAPORATION',
 ]

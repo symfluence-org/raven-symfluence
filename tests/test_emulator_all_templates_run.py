@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2024-2026 SYMFLUENCE Team <dev@symfluence.org>
 
-"""End-to-end run test across all four wired Raven emulator templates.
+"""End-to-end run test across all eight wired Raven hydrologic emulator templates.
 
-Parametrizes over ``GR4JCN``, ``HBVEC``, ``HMETS``, ``MOHYSE``: for each template it
-builds a self-contained model-ready store (canonical CFIF forcing + grouped attributes),
-drives the *plugin's* :func:`raven_symfluence.emulator.build_and_run_emulator` — the exact
-function ``RavenRunner``/``RavenWorker`` call — against it, RUNS the real raven binary, and
-asserts a non-empty, finite, non-negative, non-zero simulated streamflow series comes back.
+Parametrizes over ``GR4JCN``, ``HBVEC``, ``HMETS``, ``MOHYSE``, ``BLENDED``,
+``CANADIANSHIELD``, ``HYPR``, ``SACSMA``: for each template it builds a self-contained
+model-ready store (canonical CFIF forcing + grouped attributes), drives the *plugin's*
+:func:`raven_symfluence.emulator.build_and_run_emulator` — the exact function
+``RavenRunner``/``RavenWorker`` call — against it, RUNS the real raven binary, and asserts a
+non-empty, finite, non-negative, non-zero simulated streamflow series comes back.
 
 This proves each template is wired through the template-aware emulator path (right RavenPy
-class, parameter ordering, and the minimal per-template extras: RAINSNOW_DINGMAN override
-for HMETS/MOHYSE, monthly-ave climatology for HBVEC).
+class, parameter ordering, and the minimal per-template extras driven by PRECIP + TEMP_AVE
+only: RAINSNOW_DINGMAN override for HMETS/MOHYSE/SACSMA, monthly-ave climatology for HBVEC/HYPR,
+the PET_OUDIN override + organic/bedrock HRU pair for CanadianShield).
 
 Skipped automatically when RavenPy or the raven binary is unavailable.
 """
@@ -75,6 +77,45 @@ TEMPLATE_PARAMS = {
         [f"X{i:02d}" for i in range(1, 11)],
         [1.0, 0.0468, 4.2952, 2.658, 0.4038, 0.0621, 0.0273, 0.0453, 0.9039, 5.6167],
     )),
+    # BLENDED X01..X35 then R01..R08 (RavenPy Blended example params, tests/emulators.py).
+    "BLENDED": dict(zip(
+        [f"X{i:02d}" for i in range(1, 36)] + [f"R{i:02d}" for i in range(1, 9)],
+        [2.930702e-02, 2.211166e00, 2.166229e00, 0.0002254976, 2.173976e01, 1.565091e00,
+         6.211146e00, 9.313578e-01, 3.486263e-02, 0.251835, 0.0002279250, 1.214339e00,
+         4.736668e-02, 0.2070342, 7.806324e-02, -1.336429e00, 2.189741e-01, 3.845617e00,
+         2.950022e-01, 4.827523e-01, 4.099820e00, 1.283144e01, 5.937894e-01, 1.651588e00,
+         1.705806, 3.719308e-01, 7.121015e-02, 1.906440e-02, 4.080660e-01, 9.415693e-01,
+         -1.856108e00, 2.356995e00, 1.0e00, 1.0e00, 7.510967e-03, 5.321608e-01, 2.891977e-02,
+         9.605330e-01, 6.128669e-01, 9.558293e-01, 1.008196e-01, 9.275730e-02, 7.469583e-01],
+    )),
+    # CANADIANSHIELD X01..X34 (RavenPy CanadianShield example params, tests/emulators.py).
+    "CANADIANSHIELD": dict(zip(
+        [f"X{i:02d}" for i in range(1, 35)],
+        [4.72304300e-01, 8.16392200e-01, 9.86197600e-02, 3.92699900e-03, 4.69073600e-02,
+         4.95528400e-01, 6.803492000e00, 4.33050200e-03, 1.01425900e-05, 1.823470000e00,
+         5.12215400e-01, 9.017555000e00, 3.077103000e01, 5.094095000e01, 1.69422700e-01,
+         8.23412200e-02, 2.34595300e-01, 7.30904000e-02, 1.284052000e00, 3.653415000e00,
+         2.306515000e01, 2.402183000e00, 2.522095000e00, 5.80344900e-01, 1.614157000e00,
+         6.031781000e00, 3.11129800e-01, 6.71695100e-02, 5.83759500e-05, 9.824723000e00,
+         9.00747600e-01, 8.04057300e-01, 1.179003000e00, 7.98001300e-01],
+    )),
+    # HYPR X01..X21 (RavenPy HYPR example params, tests/emulators.py).
+    "HYPR": dict(zip(
+        [f"X{i:02d}" for i in range(1, 22)],
+        [-1.856410e-01, 2.92301100e00, 3.1194200e-02, 4.3982810e-01, 4.6509760e-01,
+         1.1770040e-01, 1.31236800e01, 4.0417950e-01, 1.21225800e00, 5.91273900e01,
+         1.6612030e-01, 4.10501500e00, 8.2296110e-01, 4.15635200e01, 5.85111700e00,
+         6.9090140e-01, 9.2459950e-01, 1.64358800e00, 1.59920500e00, 2.51938100e00,
+         1.14820100e00],
+    )),
+    # SACSMA X01..X21 (RavenPy SACSMA example params, tests/emulators.py). X01..X03 are log10
+    # quantities in the canonical example; values are used verbatim in P order.
+    "SACSMA": dict(zip(
+        [f"X{i:02d}" for i in range(1, 22)],
+        [0.0100000, 0.0500000, 0.3000000, 0.0500000, 0.0500000, 0.1300000, 0.0250000,
+         0.0600000, 0.0600000, 1.0000000, 40.000000, 0.0000000, 0.0000000, 0.1000000,
+         0.0000000, 0.0100000, 1.5000000, 0.4827523, 4.0998200, 1.0000000, 1.0000000],
+    )),
 }
 
 
@@ -126,7 +167,10 @@ def _build_attributes(attrs_dir: Path, domain: str) -> None:
         te.createVariable("elev_mean", "f8", ("hru",))[:] = [ELEV]
 
 
-@pytest.mark.parametrize("template", ["GR4JCN", "HBVEC", "HMETS", "MOHYSE"])
+@pytest.mark.parametrize("template", [
+    "GR4JCN", "HBVEC", "HMETS", "MOHYSE",
+    "BLENDED", "CANADIANSHIELD", "HYPR", "SACSMA",
+])
 def test_emulator_template_runs_and_returns_streamflow(template, tmp_path, monkeypatch):
     """Each Raven template runs the real binary via the plugin and returns finite streamflow."""
     monkeypatch.setenv("RAVENPY_RAVEN_BINARY_PATH", str(RAVEN_EXEC_PATH))
