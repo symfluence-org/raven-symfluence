@@ -1,0 +1,4 @@
+# Real per-engine configs hold machine-specific absolute paths — keep them local.
+# Only the *.example.yaml templates are tracked.
+config_*.yaml
+!*.example.yaml

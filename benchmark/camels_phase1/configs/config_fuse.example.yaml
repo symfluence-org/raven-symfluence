@@ -1,0 +1,84 @@
+# Multi-engine benchmark — FUSE leg  [EXAMPLE — fill in the paths]
+#
+# Copy to configs/config_fuse.yaml and set the absolute paths below. FUSE's
+# model_specific_preprocessing builds the FUSE-native store from the shared
+# model-ready store (the "first-class model" claim — no plugin code needed).
+#
+# NOTE on fairness: FUSE cold-starts DDS from raw defaults (start KGE ~ -0.15 on
+# Bow) and is starting-point sensitive in its 13-D space — see ../README.md.
+SYMFLUENCE_DATA_DIR: /path/to/SYMFLUENCE_data
+SYMFLUENCE_CODE_DIR: /path/to/SYMFLUENCE
+NUM_PROCESSES: 1
+DEBUG_MODE: false
+LOG_LEVEL: INFO
+LOG_TO_FILE: true
+LOG_FORMAT: detailed
+FORCE_RUN_ALL_STEPS: false
+USE_LOCAL_SCRATCH: false
+STOP_ON_ERROR: true
+DOMAIN_NAME: multimodel_benchmark
+EXPERIMENT_ID: fuse_run
+EXPERIMENT_TIME_START: 2002-01-01 01:00
+EXPERIMENT_TIME_END: 2009-12-31 23:00
+CALIBRATION_PERIOD: 2004-01-01, 2007-12-31
+EVALUATION_PERIOD: 2008-01-01, 2009-12-31
+SPINUP_PERIOD: 2002-01-01, 2003-12-31
+DOMAIN_DEFINITION_METHOD: lumped
+SUB_GRID_DISCRETIZATION: GRUS
+ROUTING_DELINEATION: lumped
+POUR_POINT_COORDS: 51.1722/-115.5717
+BOUNDING_BOX_COORDS: 51.76/-116.55/50.95/-115.5
+BUILD_MODEL_READY_STORE: true
+MODEL_READY_FORCING_STRATEGY: symlink
+FORCING_DATASET: ERA5
+FORCING_TIME_STEP_SIZE: 3600
+PET_METHOD: oudin
+
+HYDROLOGICAL_MODEL: FUSE
+ROUTING_MODEL: none
+
+# --- FUSE ---
+FUSE_INSTALL_PATH: /path/to/SYMFLUENCE_data/installs/fuse/bin
+FUSE_EXE: fuse.exe
+FUSE_ROUTING_INTEGRATION: default
+SETTINGS_FUSE_PATH: default
+SETTINGS_FUSE_FILEMANAGER: fm_catch.txt
+FUSE_SPATIAL_MODE: lumped
+FUSE_SUBCATCHMENT_DIM: longitude
+EXPERIMENT_OUTPUT_FUSE: default
+SETTINGS_FUSE_PARAMS_TO_CALIBRATE: MAXWATR_1,MAXWATR_2,BASERTE,QB_POWR,TIMEDELAY,PERCRTE,FRACTEN,RTFRAC1,MBASE,MFMAX,MFMIN,PXTEMP,LAPSE
+FUSE_DECISION_OPTIONS: {}
+FUSE_N_ELEVATION_BANDS: 1
+FUSE_TIMEOUT: 3600
+# Use SYMFLUENCE's external DDS optimizer (FUSE's built-in SCE crashes with a
+# Fortran list-input parse error on this build) so the eval metric is produced
+# the same way as the other engines.
+FUSE_RUN_INTERNAL_CALIBRATION: false
+
+# --- Optimization ---
+OPTIMIZATION_METHODS:
+- iteration
+OPTIMIZATION_TARGET: streamflow
+CALIBRATION_VARIABLE: streamflow
+CALIBRATION_TIMESTEP: daily
+ITERATIVE_OPTIMIZATION_ALGORITHM: DDS
+OPTIMIZATION_METRIC: KGE
+NUMBER_OF_ITERATIONS: 1000
+POPULATION_SIZE: 10
+DDS_R: 0.2
+CLEANUP_PARALLEL_DIRS: true
+TARGET_METRIC: KGE
+
+# --- Observations ---
+STREAMFLOW_DATA_PROVIDER: WSC
+SIM_REACH_ID: 228
+STATION_ID: 05BB001
+STREAMFLOW_PROCESSED_PATH: default
+
+# --- Shapefile conventions (match the source domain) ---
+CATCHMENT_SHP_LAT: center_lat
+CATCHMENT_SHP_LON: center_lon
+CATCHMENT_SHP_AREA: HRU_area
+CATCHMENT_SHP_ELEV: elev_mean
+CATCHMENT_SHP_HRUID: HRU_ID
+CATCHMENT_SHP_GRUID: GRU_ID

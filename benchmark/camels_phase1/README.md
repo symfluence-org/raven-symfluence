@@ -20,34 +20,46 @@ store under a fresh temp dir (or `--workdir`).
 
 ## How to run
 
+The harness has two modes:
+
+**1. Synthetic-fixture mode** (default, no args) — fabricates per-engine synthetic
+discharge against a synthetic observation series and scores KGE/NSE. Needs no model
+binaries and no real data; safe to run anywhere (CI self-check).
+
 ```bash
-# All engines, fixture store in a temp dir, outputs in ./bench_out
-python benchmark/camels_phase1/run_benchmark.py -v
-
-# Subset of engines
-python benchmark/camels_phase1/run_benchmark.py --engines RAVEN
-
-# Keep the fixture store + choose an output dir
-python benchmark/camels_phase1/run_benchmark.py \
-    --workdir /path/to/scratch --outdir /path/to/out
-
-# Assemble the comparison from a REAL domain's completed standard-workflow runs
-# (reads optimization/<ENGINE>/*_dds_final_evaluation.json) — how the result below was made
-python benchmark/camels_phase1/run_benchmark.py \
-    --from-domain /path/to/domain_multimodel_benchmark \
-    --engines RAVEN SUMMA FUSE --outdir benchmark/camels_phase1/results
+python benchmark/camels_phase1/run_benchmark.py            # all engines, synthetic
+python benchmark/camels_phase1/run_benchmark.py --out ./bench_out
 ```
 
-Binaries are auto-resolved (skipped engines are reported, not errored):
+**2. Real-domain mode** (`--domain <path>`) — drives each first-class SYMFLUENCE model
+through the *standard* workflow (`model_specific_preprocessing → run_model →
+postprocess_results → calibrate_model`) on a real domain, using the per-engine config
+`configs/config_<engine>.yaml`, then reads each engine's
+`optimization/<MODEL>/*_dds_final_evaluation.json` into `results.csv` + `comparison.png`.
 
-| Engine | Resolution | Override |
-|--------|-----------|----------|
-| Raven  | RavenPy's `RAVEN_EXEC_PATH` / `RAVENPY_RAVEN_BINARY_PATH` / PATH | `RAVENPY_RAVEN_BINARY_PATH` |
-| FUSE   | `FUSE_INSTALL_PATH`/`FUSE_EXE`, else `fuse.exe` on PATH | `FUSE_INSTALL_PATH` + `FUSE_EXE` |
-| SUMMA  | SUMMA-hydro-named binary on PATH, else `SUMMA_INSTALL_PATH`/`SUMMA_EXE` | `SUMMA_INSTALL_PATH` + `SUMMA_EXE` |
+```bash
+# Copy the example configs and fill in your absolute paths first:
+cp configs/config_raven.example.yaml configs/config_raven.yaml   # then edit paths
+# (repeat for fuse / summa)
 
-A bare `summa` on PATH is intentionally **not** accepted (it's usually an unrelated
-coreutil on macOS); SUMMA skips until a real SUMMA-hydro build is provided.
+# Run the engines end-to-end on an isolated domain:
+python benchmark/camels_phase1/run_benchmark.py \
+    --domain /path/to/SYMFLUENCE_data/domain_multimodel_benchmark \
+    --engines raven fuse summa \
+    --out benchmark/camels_phase1/results
+
+# Already calibrated? Just assemble the comparison from existing runs (no re-run):
+python benchmark/camels_phase1/run_benchmark.py \
+    --domain /path/to/SYMFLUENCE_data/domain_multimodel_benchmark \
+    --engines raven fuse summa --no-run
+```
+
+Engine names are lowercase (`raven`, `fuse`, `summa`). The actual `config_<engine>.yaml`
+files hold machine-specific absolute paths and are git-ignored; only the
+`*.example.yaml` templates are tracked. Binaries are resolved from each config's
+`*_INSTALL_PATH`/`*_EXE` keys (a bare `summa` on macOS PATH is an unrelated coreutil and
+is not used). The harness **never writes into a real domain** unless you point `--domain`
+at one — use an isolated copy (e.g. `domain_multimodel_benchmark` with symlinked inputs).
 
 ## Outputs
 

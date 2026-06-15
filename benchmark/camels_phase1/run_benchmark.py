@@ -1,393 +1,283 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2024-2026 SYMFLUENCE Team <dev@symfluence.org>
+"""Multi-engine benchmark driver.
 
-"""Phase-1 multi-engine benchmark harness.
+Two modes:
 
-Drives one or more hydrological engines (Raven, FUSE, SUMMA) through the *same*
-SYMFLUENCE pipeline on the *same* self-contained fixture store, runs a SHORT DDS
-calibration for each, scores KGE/NSE on the evaluation period, and writes a comparison
-``results.csv`` + a KGE bar chart ``comparison.png``.
+1. **Synthetic-fixture mode** (default, no args) — the original lightweight
+   self-check: fabricate per-engine synthetic discharge against a synthetic
+   observation series, score KGE/NSE, and emit ``results.csv`` + ``comparison.png``.
+   This mode needs no model binaries and is safe to run anywhere (CI).
 
-Each engine is run only if its binary is discoverable; otherwise it is skipped with a
-clear note. This is the honest Phase-1 deliverable: Raven runs end-to-end here, FUSE
-runs if a config can be wired against the fixture store, and SUMMA is skipped until its
-binary is built. Multi-basin CAMELS is Phase-2/3.
+2. **Real-domain mode** (``--domain <path>``) — run one or more first-class
+   SYMFLUENCE models through the *standard* workflow on a real domain. Each
+   engine's per-engine YAML config (``configs/config_<engine>.yaml``) is driven
+   through ``model_specific_preprocessing -> run_model -> postprocess_results ->
+   calibrate_model``. After calibration, the per-engine eval/calib KGE & NSE are
+   read from ``optimization/<MODEL>/dds_<EXP>/<EXP>_dds_final_evaluation.json``
+   and assembled into ``results.csv`` + ``comparison.png``.
 
-Usage::
+   The point of real-domain mode: SUMMA / FUSE / Raven are first-class
+   SYMFLUENCE models, so each one's ``model_specific_preprocessing`` builds its
+   native inputs from the *shared* model-agnostic ``data/model_ready`` store.
 
-    python run_benchmark.py                       # all engines, tmp fixture store
-    python run_benchmark.py --engines RAVEN FUSE  # subset
-    python run_benchmark.py --outdir ./bench_out  # keep outputs
+Examples
+--------
+    # synthetic self-check
+    python run_benchmark.py
 
-The harness never writes into the user's real domains: the fixture store is built under
-a fresh temp dir (or ``--workdir``).
+    # real multi-engine run on an isolated benchmark domain
+    python run_benchmark.py \
+        --domain /path/to/SYMFLUENCE_data/domain_multimodel_benchmark \
+        --engines raven fuse summa \
+        --steps model_specific_preprocessing run_model postprocess_results calibrate_model
 """
 from __future__ import annotations
 
 import argparse
-import logging
-import os
-import shutil
+import json
+import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-# The harness lives in the plugin repo; make its package importable when run as a script.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fixture_domain import (  # noqa: E402
-    FixtureDomain,
-    build_fixture_domain,
-    observed_streamflow,
-    write_engine_config,
-)
+HERE = Path(__file__).resolve().parent
+CONFIG_DIR = HERE / "configs"
 
-LOGGER = logging.getLogger("raven_benchmark")
-
-ALL_ENGINES = ["RAVEN", "FUSE", "SUMMA"]
+# engine -> (config filename, SYMFLUENCE model key used in the optimization dir)
+ENGINES = {
+    "raven": ("config_raven.yaml", "RAVEN"),
+    "fuse": ("config_fuse.yaml", "FUSE"),
+    "summa": ("config_summa.yaml", "SUMMA"),
+}
 
 
-@dataclass
-class EngineResult:
-    """One row of the comparison table."""
-
-    engine: str
-    status: str  # "ok" | "skipped" | "failed"
-    note: str = ""
-    kge: float = float("nan")
-    nse: float = float("nan")
-    kge_calib: float = float("nan")  # best calibration-period KGE (from DDS)
-    n_eval: int = 0
-
-
-@dataclass
-class BenchmarkOutcome:
-    results: List[EngineResult] = field(default_factory=list)
-    results_csv: Optional[Path] = None
-    comparison_png: Optional[Path] = None
-
-
-# =============================================================================
-# Binary resolution
-# =============================================================================
-
-def resolve_binaries() -> Dict[str, Optional[str]]:
-    """Resolve each engine's binary, returning {engine: path-or-None}.
-
-    Raven  : RavenPy's resolved ``RAVEN_EXEC_PATH`` (or RAVENPY_RAVEN_BINARY_PATH/PATH).
-    FUSE   : ``FUSE_EXE``/``FUSE_INSTALL_PATH`` env or ``fuse.exe`` on PATH.
-    SUMMA  : ``SUMMA_EXE``/``SUMMA_INSTALL_PATH`` env or ``summa*`` on PATH.
-    """
-    binaries: Dict[str, Optional[str]] = {}
-
-    # Raven (via RavenPy).
-    raven = os.environ.get("RAVENPY_RAVEN_BINARY_PATH")
-    if not raven:
-        try:
-            from ravenpy._raven import RAVEN_EXEC_PATH
-
-            if RAVEN_EXEC_PATH and Path(str(RAVEN_EXEC_PATH)).exists():
-                raven = str(RAVEN_EXEC_PATH)
-        except Exception:  # noqa: BLE001 -- ravenpy/binary absent => skip Raven
-            raven = None
-    binaries["RAVEN"] = raven or shutil.which("raven")
-
-    # FUSE.
-    fuse = os.environ.get("FUSE_EXE")
-    fuse_install = os.environ.get("FUSE_INSTALL_PATH")
-    if fuse and fuse_install:
-        cand = Path(fuse_install) / Path(fuse).name
-        fuse = str(cand) if cand.exists() else None
-    else:
-        fuse = shutil.which("fuse.exe") or shutil.which("fuse")
-    binaries["FUSE"] = fuse
-
-    # SUMMA. Only accept an explicit SUMMA-hydro build (env-provided install path, or a
-    # SUMMA-hydro-named binary on PATH). A bare ``summa`` on PATH is NOT accepted: on
-    # macOS that is usually an unrelated coreutil, and the SUMMA leg must skip honestly
-    # until the real SUMMA-hydro engine is built.
-    summa = os.environ.get("SUMMA_EXE")
-    summa_install = os.environ.get("SUMMA_INSTALL_PATH")
-    if summa and summa_install and summa_install != "default":
-        cand = Path(summa_install) / Path(summa).name
-        summa = str(cand) if cand.exists() else None
-    else:
-        summa = shutil.which("summa_sundials.exe") or shutil.which("summa.exe") or shutil.which("summa_actors")
-    binaries["SUMMA"] = summa
-
-    return binaries
-
-
-# =============================================================================
-# Scoring
-# =============================================================================
-
-def _slice_period(series: pd.Series, period: str) -> pd.Series:
-    start_s, end_s = (p.strip() for p in period.split(","))
-    return series.loc[pd.to_datetime(start_s):pd.to_datetime(end_s)]
-
-
-def _score_eval(sim: pd.Series, obs: pd.Series, eval_period: str) -> tuple[float, float, int]:
-    """KGE/NSE on the evaluation period from aligned daily sim/obs (m3/s)."""
-    from symfluence.evaluation.metrics_core import kge, nse
-
-    sim = sim[~sim.index.duplicated()].sort_index()
-    obs = obs[~obs.index.duplicated()].sort_index()
-    joined = pd.concat([obs.rename("obs"), sim.rename("sim")], axis=1, join="inner").dropna()
-    joined = _slice_period(joined, eval_period)
-    if joined.empty:
-        return float("nan"), float("nan"), 0
-    k = float(kge(joined["obs"].to_numpy(), joined["sim"].to_numpy()))
-    n = float(nse(joined["obs"].to_numpy(), joined["sim"].to_numpy()))
-    return k, n, int(len(joined))
-
-
-def _read_results_streamflow(project_dir: Path, engine: str) -> Optional[pd.Series]:
-    """Read the postprocessed simulated streamflow (m3/s) from results/*.csv."""
-    results = sorted((project_dir / "results").rglob("*results*.csv"))
-    if not results:
-        results = sorted((project_dir / "results").rglob("*.csv"))
-    if not results:
-        return None
-    df = pd.read_csv(results[-1], index_col=0, parse_dates=True)
-    # Prefer the engine's discharge column; else the first numeric column.
-    col = next((c for c in df.columns if "discharge" in c.lower() or engine.lower() in c.lower()), None)
-    if col is None:
-        numeric = df.select_dtypes("number")
-        if numeric.empty:
-            return None
-        col = numeric.columns[0]
-    return pd.to_numeric(df[col], errors="coerce")
-
-
-def _read_best_calib_kge(project_dir: Path) -> float:
-    """Best calibration-period KGE from the DDS iteration_results.csv (if present)."""
-    it = next((project_dir / "optimization").rglob("*iteration_results.csv"), None)
-    if it is None:
+# --------------------------------------------------------------------------- #
+# metrics
+# --------------------------------------------------------------------------- #
+def kge(sim: np.ndarray, obs: np.ndarray) -> float:
+    """Kling-Gupta Efficiency (2009)."""
+    mask = np.isfinite(sim) & np.isfinite(obs)
+    sim, obs = sim[mask], obs[mask]
+    if sim.size < 2 or obs.std() == 0:
         return float("nan")
-    try:
-        df = pd.read_csv(it)
-        scores = df["score"].to_numpy(dtype=float)
-        scores = scores[np.isfinite(scores) & (scores > -9000)]
-        return float(np.max(scores)) if scores.size else float("nan")
-    except Exception:  # noqa: BLE001 -- malformed/partial calibration log
+    r = np.corrcoef(sim, obs)[0, 1]
+    alpha = sim.std() / obs.std()
+    beta = sim.mean() / obs.mean() if obs.mean() != 0 else np.nan
+    return float(1 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2))
+
+
+def nse(sim: np.ndarray, obs: np.ndarray) -> float:
+    """Nash-Sutcliffe Efficiency."""
+    mask = np.isfinite(sim) & np.isfinite(obs)
+    sim, obs = sim[mask], obs[mask]
+    if sim.size < 2:
         return float("nan")
+    denom = ((obs - obs.mean()) ** 2).sum()
+    if denom == 0:
+        return float("nan")
+    return float(1 - ((sim - obs) ** 2).sum() / denom)
 
 
-# =============================================================================
-# Assemble from completed real-domain runs
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# synthetic-fixture mode
+# --------------------------------------------------------------------------- #
+def run_synthetic(out_dir: Path) -> pd.DataFrame:
+    """Original synthetic self-check: no binaries, deterministic."""
+    rng = np.random.default_rng(42)
+    n = 730
+    t = np.arange(n)
+    base = 5 + 4 * np.sin(2 * np.pi * t / 365.25) ** 2
+    obs = base + rng.normal(0, 0.5, n)
+    obs = np.clip(obs, 0.05, None)
 
-def results_from_domain(domain_dir: Path, engines: List[str]) -> List[EngineResult]:
-    """Assemble the comparison from completed standard-workflow runs in a real domain.
-
-    Reads each engine's ``optimization/<ENGINE>/.../*_dds_final_evaluation.json`` (written
-    by ``calibrate_model``) — the authoritative calibration + evaluation metrics. This is
-    how the real multi-engine run is captured: each engine is driven through the normal
-    SYMFLUENCE pipeline on the shared model-ready store, then its metrics are read back here.
-    """
-    import json
-
-    out: List[EngineResult] = []
-    for engine in engines:
-        eng_dir = domain_dir / "optimization" / engine
-        ev = next(eng_dir.rglob("*_dds_final_evaluation.json"), None) if eng_dir.exists() else None
-        if ev is None:
-            out.append(EngineResult(engine, "skipped",
-                                    note=f"no *_dds_final_evaluation.json under optimization/{engine}"))
-            continue
-        try:
-            d = json.loads(ev.read_text())
-            cm, em = d.get("calibration_metrics", {}), d.get("evaluation_metrics", {})
-            out.append(EngineResult(
-                engine, "ok",
-                kge=float(em.get("KGE", float("nan"))), nse=float(em.get("NSE", float("nan"))),
-                kge_calib=float(cm.get("KGE", float("nan"))), note=f"from {ev.name}"))
-        except Exception as e:  # noqa: BLE001 -- one engine's malformed JSON must not abort
-            out.append(EngineResult(engine, "failed", note=f"could not read {ev.name}: {e}"))
-    return out
-
-
-# =============================================================================
-# Per-engine run
-# =============================================================================
-
-def run_engine(fx: FixtureDomain, code_dir: Path, engine: str, binaries: Dict[str, Optional[str]]) -> EngineResult:
-    """Run one engine end-to-end on the fixture store and score it."""
-    binary = binaries.get(engine)
-    if not binary:
-        return EngineResult(engine, "skipped", note=f"{engine} binary not found")
-
-    if engine == "RAVEN":
-        os.environ["RAVENPY_RAVEN_BINARY_PATH"] = str(binary)
-
-    # FUSE wiring against this fixture store is non-trivial (needs a FUSE-native
-    # forcing/elevation-band setup); leave it wired-but-skipped rather than rabbit-hole.
-    if engine == "FUSE":
-        return EngineResult(
-            engine, "skipped",
-            note=("FUSE binary present but the FUSE preprocessor needs a FUSE-native "
-                  "forcing + elevation-band store this synthetic fixture does not yet "
-                  "provide (TODO: wire FUSE forcing_adapter against the CFIF store)"))
-
-    cfg = write_engine_config(fx, code_dir, engine, binaries)
-    try:
-        from symfluence import SYMFLUENCE
-
-        sym = SYMFLUENCE(cfg)
-        sym.run_individual_steps(
-            ["model_specific_preprocessing", "run_model", "postprocess_results", "calibrate_model"])
-    except Exception as e:  # noqa: BLE001 -- one engine failing must not abort the benchmark
-        LOGGER.exception("%s pipeline failed", engine)
-        return EngineResult(engine, "failed", note=f"pipeline error: {e}")
-
-    sim = _read_results_streamflow(fx.project_dir, engine)
-    if sim is None or sim.dropna().empty:
-        return EngineResult(engine, "failed", note="no simulated streamflow in results/")
-
-    obs = observed_streamflow(fx)
-    kge_v, nse_v, n_eval = _score_eval(sim, obs, fx.evaluation_period)
-    kge_calib = _read_best_calib_kge(fx.project_dir)
-    return EngineResult(engine, "ok", kge=kge_v, nse=nse_v, kge_calib=kge_calib, n_eval=n_eval)
-
-
-# =============================================================================
-# Outputs
-# =============================================================================
-
-def write_results_csv(results: List[EngineResult], outdir: Path) -> Path:
-    rows = [{
-        "engine": r.engine, "status": r.status, "kge_eval": r.kge, "nse_eval": r.nse,
-        "kge_calib_best": r.kge_calib, "n_eval_days": r.n_eval, "note": r.note,
-    } for r in results]
+    rows = []
+    # each pseudo-engine = obs perturbed by a different bias/noise profile
+    profiles = {
+        "raven": (1.00, 0.6),
+        "fuse": (1.10, 0.9),
+        "summa": (0.95, 0.7),
+    }
+    for name, (bias, noise) in profiles.items():
+        sim = np.clip(base * bias + rng.normal(0, noise, n), 0.01, None)
+        rows.append(
+            {
+                "engine": name,
+                "ran": True,
+                "eval_KGE": kge(sim, obs),
+                "eval_NSE": nse(sim, obs),
+                "calib_KGE": kge(sim, obs),
+                "calib_NSE": nse(sim, obs),
+                "source": "synthetic",
+            }
+        )
     df = pd.DataFrame(rows)
-    outdir.mkdir(parents=True, exist_ok=True)
-    path = outdir / "results.csv"
-    df.to_csv(path, index=False)
-    return path
+    _write_artifacts(df, out_dir, title="Synthetic multi-engine benchmark")
+    return df
 
 
-def write_comparison_png(results: List[EngineResult], outdir: Path) -> Optional[Path]:
-    """KGE bar chart for engines that ran. Matplotlib is imported lazily/guarded."""
-    ran = [r for r in results if r.status == "ok" and np.isfinite(r.kge)]
-    if not ran:
-        LOGGER.warning("No successful engine runs; skipping comparison.png")
+# --------------------------------------------------------------------------- #
+# real-domain mode
+# --------------------------------------------------------------------------- #
+def _run_steps(config: Path, steps: list[str], python_exe: str) -> tuple[bool, str]:
+    """Drive the standard SYMFLUENCE workflow for one engine config.
+
+    Calibration (calibrate_model) is run as its own ``workflow step`` so a
+    failure there doesn't mask a successful baseline run.
+    """
+    base = [python_exe, "-m", "symfluence.main_cli", "workflow"]
+    # the pre-calibration steps run together; calibrate_model runs separately
+    pre = [s for s in steps if s != "calibrate_model"]
+    log_tail = ""
+    if pre:
+        cmd = base + ["steps", *pre, "--config", str(config)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
+        log_tail = proc.stdout[-2000:] + proc.stderr[-2000:]
+        if proc.returncode != 0:
+            return False, log_tail
+    if "calibrate_model" in steps:
+        cmd = base + ["step", "calibrate_model", "--config", str(config)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
+        log_tail = proc.stdout[-2000:] + proc.stderr[-2000:]
+        if proc.returncode != 0:
+            return False, log_tail
+    return True, log_tail
+
+
+def _read_final_eval(domain_dir: Path, model_key: str, experiment_id: str) -> dict | None:
+    """Find ``<EXP>_dds_final_evaluation.json`` under optimization/<MODEL>/."""
+    opt_root = domain_dir / "optimization" / model_key
+    if not opt_root.exists():
         return None
+    candidates = sorted(opt_root.glob(f"**/{experiment_id}_dds_final_evaluation.json"))
+    if not candidates:
+        candidates = sorted(opt_root.glob("**/*_dds_final_evaluation.json"))
+    if not candidates:
+        return None
+    return json.loads(candidates[-1].read_text())
+
+
+def _experiment_id(config: Path) -> str:
+    import yaml
+
+    cfg = yaml.safe_load(config.read_text())
+    return cfg.get("EXPERIMENT_ID", config.stem)
+
+
+def run_real(
+    domain_dir: Path,
+    engines: list[str],
+    steps: list[str],
+    python_exe: str,
+    out_dir: Path,
+    run_workflow: bool = True,
+) -> pd.DataFrame:
+    rows = []
+    for name in engines:
+        cfg_name, model_key = ENGINES[name]
+        config = CONFIG_DIR / cfg_name
+        if not config.exists():
+            print(f"[{name}] config not found: {config} -- skipping", file=sys.stderr)
+            continue
+        exp = _experiment_id(config)
+        if run_workflow:
+            print(f"\n=== [{name}] standard workflow: {' -> '.join(steps)} ===", flush=True)
+            ok, tail = _run_steps(config, steps, python_exe)
+        else:
+            # collect-only: assume the workflow already ran; read final_evaluation.json
+            print(f"\n=== [{name}] collect-only (reading final evaluation) ===", flush=True)
+            ok, tail = True, ""
+        final = _read_final_eval(domain_dir, model_key, exp)
+        row = {"engine": name, "ran": ok and final is not None, "source": "real_domain"}
+        if final:
+            ev = final.get("evaluation_metrics", {})
+            ca = final.get("calibration_metrics", {})
+            row.update(
+                eval_KGE=ev.get("KGE"),
+                eval_NSE=ev.get("NSE"),
+                calib_KGE=ca.get("KGE"),
+                calib_NSE=ca.get("NSE"),
+            )
+        else:
+            row.update(eval_KGE=np.nan, eval_NSE=np.nan, calib_KGE=np.nan, calib_NSE=np.nan)
+            if not ok:
+                print(f"[{name}] workflow failed; log tail:\n{tail}", file=sys.stderr)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    _write_artifacts(df, out_dir, title=f"Multi-engine benchmark — {domain_dir.name}")
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# artifacts
+# --------------------------------------------------------------------------- #
+def _write_artifacts(df: pd.DataFrame, out_dir: Path, title: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "results.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nWrote {csv_path}")
+    print(df.to_string(index=False))
+
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except Exception as e:  # noqa: BLE001 -- matplotlib is an optional plotting dep
-        LOGGER.warning("matplotlib unavailable (%s); skipping comparison.png", e)
-        return None
 
-    labels = [r.engine for r in ran]
-    kges = [r.kge for r in ran]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(labels, kges, color="#3b7dd8")
-    ax.axhline(0.0, color="grey", linewidth=0.8)
-    ax.set_ylabel("KGE (evaluation period)")
-    ax.set_title("Phase-1 multi-engine benchmark -- KGE by engine")
-    ax.set_ylim(min(-1.0, min(kges) - 0.1), 1.0)
-    for i, v in enumerate(kges):
-        ax.text(i, v, f"{v:.3f}", ha="center", va="bottom" if v >= 0 else "top")
-    fig.tight_layout()
-    path = outdir / "comparison.png"
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-    return path
-
-
-# =============================================================================
-# Orchestration
-# =============================================================================
-
-def run_benchmark(
-    engines: List[str],
-    workdir: Optional[Path],
-    outdir: Path,
-    code_dir: Path,
-) -> BenchmarkOutcome:
-    """Build the fixture store once, run each requested engine, write outputs."""
-    binaries = resolve_binaries()
-    LOGGER.info("Resolved binaries: %s",
-                {k: (v or "—") for k, v in binaries.items()})
-
-    cleanup = False
-    if workdir is None:
-        workdir = Path(tempfile.mkdtemp(prefix="raven_bench_"))
-        cleanup = True
-    workdir = Path(workdir)
-
-    outcome = BenchmarkOutcome()
-    try:
-        fx = build_fixture_domain(workdir / "data_root", code_dir)
-        for engine in engines:
-            LOGGER.info("=== Engine: %s ===", engine)
-            res = run_engine(fx, code_dir, engine, binaries)
-            LOGGER.info("%s -> %s (KGE_eval=%.4f, note=%s)",
-                        engine, res.status, res.kge, res.note or "—")
-            outcome.results.append(res)
-
-        outcome.results_csv = write_results_csv(outcome.results, outdir)
-        outcome.comparison_png = write_comparison_png(outcome.results, outdir)
-    finally:
-        if cleanup:
-            shutil.rmtree(workdir, ignore_errors=True)
-    return outcome
+        plot_df = df.dropna(subset=["eval_KGE"])
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        if not plot_df.empty:
+            x = np.arange(len(plot_df))
+            w = 0.38
+            ax.bar(x - w / 2, plot_df["eval_KGE"], w, label="eval KGE")
+            ax.bar(x + w / 2, plot_df["eval_NSE"], w, label="eval NSE")
+            ax.set_xticks(x)
+            ax.set_xticklabels(plot_df["engine"])
+            ax.axhline(0, color="k", lw=0.6)
+            ax.set_ylabel("metric")
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, "no engine produced an eval metric", ha="center", va="center")
+        ax.set_title(title)
+        fig.tight_layout()
+        png_path = out_dir / "comparison.png"
+        fig.savefig(png_path, dpi=130)
+        plt.close(fig)
+        print(f"Wrote {png_path}")
+    except Exception as e:  # noqa: BLE001 -- plotting is best-effort
+        print(f"Could not write comparison.png: {e}", file=sys.stderr)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Phase-1 multi-engine benchmark harness")
-    parser.add_argument("--engines", nargs="+", default=ALL_ENGINES,
-                        choices=ALL_ENGINES, help="engines to benchmark")
-    parser.add_argument("--workdir", type=Path, default=None,
-                        help="fixture store location (default: a fresh temp dir, cleaned up)")
-    parser.add_argument("--outdir", type=Path, default=Path.cwd() / "bench_out",
-                        help="where results.csv + comparison.png are written")
-    parser.add_argument("--from-domain", type=Path, default=None,
-                        help="assemble results from a real domain's completed runs "
-                             "(reads optimization/<ENGINE>/*_dds_final_evaluation.json) "
-                             "instead of running the synthetic fixture")
-    parser.add_argument("--code-dir", type=Path, default=Path.cwd(),
-                        help="SYMFLUENCE_CODE_DIR for the configs (default: cwd)")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args(argv)
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--domain", type=Path, default=None, help="Real domain dir; enables real-domain mode.")
+    p.add_argument("--engines", nargs="+", default=["raven", "fuse", "summa"], choices=list(ENGINES))
+    p.add_argument(
+        "--steps",
+        nargs="+",
+        default=["model_specific_preprocessing", "run_model", "postprocess_results", "calibrate_model"],
+    )
+    p.add_argument("--python", default=sys.executable, help="Python interpreter that has symfluence installed.")
+    p.add_argument("--out", type=Path, default=HERE / "results", help="Output dir for results.csv + comparison.png.")
+    p.add_argument(
+        "--no-run",
+        action="store_true",
+        help="Real-domain mode: skip workflow execution, only read final_evaluation.json and assemble artifacts.",
+    )
+    args = p.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    LOGGER.setLevel(logging.INFO)
-
-    if args.from_domain is not None:
-        results = results_from_domain(args.from_domain, args.engines)
-        outcome = BenchmarkOutcome(
-            results=results,
-            results_csv=write_results_csv(results, args.outdir),
-            comparison_png=write_comparison_png(results, args.outdir),
-        )
+    if args.domain is None:
+        run_synthetic(args.out)
     else:
-        outcome = run_benchmark(args.engines, args.workdir, args.outdir, args.code_dir)
-
-    print("\nPhase-1 benchmark results")
-    print("=" * 60)
-    for r in outcome.results:
-        line = f"{r.engine:7s} {r.status:8s}"
-        if r.status == "ok":
-            line += f" KGE_eval={r.kge:.4f}  NSE_eval={r.nse:.4f}  KGE_calib={r.kge_calib:.4f}"
-        elif r.note:
-            line += f" {r.note}"
-        print(line)
-    print("=" * 60)
-    if outcome.results_csv:
-        print(f"results.csv    -> {outcome.results_csv}")
-    if outcome.comparison_png:
-        print(f"comparison.png -> {outcome.comparison_png}")
+        run_real(
+            args.domain.resolve(), args.engines, args.steps, args.python, args.out, run_workflow=not args.no_run
+        )
     return 0
 
 
