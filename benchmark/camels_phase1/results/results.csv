@@ -1,0 +1,4 @@
+engine,status,kge_eval,nse_eval,kge_calib_best,n_eval_days,note
+RAVEN,ok,0.7003976178283653,0.5890256252665002,0.7919571814986376,0,from raven_gr4jcn_dds_final_evaluation.json
+SUMMA,ok,0.7339983104058543,0.4507743055349891,0.7450279101921957,0,from summa_run_dds_final_evaluation.json
+FUSE,ok,0.49328190088272095,-0.05348706245422363,0.42030149698257446,0,from fuse_run_dds_final_evaluation.json

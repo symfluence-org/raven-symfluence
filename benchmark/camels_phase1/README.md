@@ -30,6 +30,12 @@ python benchmark/camels_phase1/run_benchmark.py --engines RAVEN
 # Keep the fixture store + choose an output dir
 python benchmark/camels_phase1/run_benchmark.py \
     --workdir /path/to/scratch --outdir /path/to/out
+
+# Assemble the comparison from a REAL domain's completed standard-workflow runs
+# (reads optimization/<ENGINE>/*_dds_final_evaluation.json) — how the result below was made
+python benchmark/camels_phase1/run_benchmark.py \
+    --from-domain /path/to/domain_multimodel_benchmark \
+    --engines RAVEN SUMMA FUSE --outdir benchmark/camels_phase1/results
 ```
 
 Binaries are auto-resolved (skipped engines are reported, not errored):
@@ -69,31 +75,41 @@ basin instead of the fixture:
 Phase-2 will fold steps 1–3 into the harness for a named CAMELS basin; Phase-3 sweeps
 the multi-basin CAMELS set.
 
-## Honest status
+## Validated real-domain result (Bow at Banff, lumped)
 
-- **Raven — validated.** Runs end-to-end through this harness on the fixture store and
-  produces a real KGE row. (See `tests/test_wrap_fidelity.py`: SYMFLUENCE-driven Raven is
-  byte-for-byte identical to standalone RavenPy at `rtol=atol=1e-9`.)
-- **FUSE — wired but skipped.** The FUSE binary is detected, but the FUSE preprocessor
-  needs a FUSE-native forcing + elevation-band store this synthetic lumped fixture does
-  not yet build. Wiring the FUSE `forcing_adapter` against the CFIF fixture store is the
-  one remaining TODO for the FUSE leg (intentionally not rabbit-holed in Phase-1).
-- **SUMMA — skipped.** No SUMMA-hydro binary is built in this environment. SUMMA also
-  needs intersected catchment shapefiles (`acquire`/`discretize` outputs) the lumped
-  fixture does not provide.
-- **Eval-period KGE** is computed from the postprocessed `results/*.csv` of the run leg.
-  `kge_calib_best` reflects the (stochastic, unseeded) DDS loop and will vary run-to-run.
+All three engines were driven through the standard SYMFLUENCE workflow
+(`model_specific_preprocessing → run_model → postprocess_results → calibrate_model`) on
+one real lumped basin sharing a single model-ready store, then assembled with
+`--from-domain`. Short DDS budgets (15–20 iters — a smoke run, not publication-grade):
 
-### What a real single-CAMELS-basin 3-engine run still needs
+| Engine | KGE (calib) | **KGE (eval)** | NSE (eval) |
+|--------|------------:|---------------:|-----------:|
+| **Raven** (GR4JCN) | 0.792 | **0.700** | 0.589 |
+| **SUMMA** (v4.0.0) | 0.745 | **0.734** | 0.451 |
+| **FUSE**           | 0.420 | **0.493** | −0.053 |
 
-1. **SUMMA build** — compile SUMMA-hydro (`summa_sundials.exe`) and point
-   `SUMMA_INSTALL_PATH` at it.
-2. **FUSE config** — a FUSE-native forcing/elevation-band store (FUSE `forcing_adapter`)
-   built from the same domain so the FUSE leg can preprocess.
-3. **Data acquisition** — a real CAMELS(-SPAT) domain (forcing, attributes, catchment +
-   river shapefiles) instead of the synthetic fixture.
-4. **Compute** — real basins + meaningful DDS budgets (hundreds of iterations × 3
-   engines) are far heavier than the fixture's 6-iteration smoke loop.
+The point holds: feeding all three engines from the same model-agnostic store via the
+normal workflow yields a like-for-like comparison, and **the Raven wrap is fully
+competitive** (best NSE, second KGE) — driven entirely through SYMFLUENCE.
+
+## Status
+
+- **Raven — validated** end-to-end (fixture + real domain). `tests/test_wrap_fidelity.py`
+  shows SYMFLUENCE-driven Raven is identical to standalone RavenPy at `rtol=atol=1e-9`.
+- **FUSE — validated on the real domain.** Its `model_specific_preprocessing` builds the
+  FUSE-native store from the shared model-ready store (the "first-class model" claim). The
+  *synthetic fixture* leg stays skipped (the fixture doesn't build FUSE-native inputs); use
+  `--from-domain` / a real domain for FUSE.
+- **SUMMA — validated on the real domain** (SUMMA-hydro v4.0.0). Skips in the synthetic
+  fixture (no SUMMA-hydro binary + needs discretized shapefiles).
+
+### What a publication-grade run still needs
+
+1. **Bigger DDS budgets** (500–2000+ iters with a proper spin-up/warmup hold-out — the
+   numbers above are a smoke run; FUSE's eval NSE is still negative).
+2. **Many basins** — a CAMELS-scale sweep across gauges/regimes, not one basin.
+3. **Performance** — cache the daily-aggregated forcing; Raven currently rebuilds forcing
+   per DDS trial (~73 s/trial) and FUSE's hourly `.load()` is slow.
 
 ---
 Repo and code assistance from [Claude](https://claude.ai) (Anthropic).

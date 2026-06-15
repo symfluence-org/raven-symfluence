@@ -179,6 +179,40 @@ def _read_best_calib_kge(project_dir: Path) -> float:
 
 
 # =============================================================================
+# Assemble from completed real-domain runs
+# =============================================================================
+
+def results_from_domain(domain_dir: Path, engines: List[str]) -> List[EngineResult]:
+    """Assemble the comparison from completed standard-workflow runs in a real domain.
+
+    Reads each engine's ``optimization/<ENGINE>/.../*_dds_final_evaluation.json`` (written
+    by ``calibrate_model``) — the authoritative calibration + evaluation metrics. This is
+    how the real multi-engine run is captured: each engine is driven through the normal
+    SYMFLUENCE pipeline on the shared model-ready store, then its metrics are read back here.
+    """
+    import json
+
+    out: List[EngineResult] = []
+    for engine in engines:
+        eng_dir = domain_dir / "optimization" / engine
+        ev = next(eng_dir.rglob("*_dds_final_evaluation.json"), None) if eng_dir.exists() else None
+        if ev is None:
+            out.append(EngineResult(engine, "skipped",
+                                    note=f"no *_dds_final_evaluation.json under optimization/{engine}"))
+            continue
+        try:
+            d = json.loads(ev.read_text())
+            cm, em = d.get("calibration_metrics", {}), d.get("evaluation_metrics", {})
+            out.append(EngineResult(
+                engine, "ok",
+                kge=float(em.get("KGE", float("nan"))), nse=float(em.get("NSE", float("nan"))),
+                kge_calib=float(cm.get("KGE", float("nan"))), note=f"from {ev.name}"))
+        except Exception as e:  # noqa: BLE001 -- one engine's malformed JSON must not abort
+            out.append(EngineResult(engine, "failed", note=f"could not read {ev.name}: {e}"))
+    return out
+
+
+# =============================================================================
 # Per-engine run
 # =============================================================================
 
@@ -316,6 +350,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="fixture store location (default: a fresh temp dir, cleaned up)")
     parser.add_argument("--outdir", type=Path, default=Path.cwd() / "bench_out",
                         help="where results.csv + comparison.png are written")
+    parser.add_argument("--from-domain", type=Path, default=None,
+                        help="assemble results from a real domain's completed runs "
+                             "(reads optimization/<ENGINE>/*_dds_final_evaluation.json) "
+                             "instead of running the synthetic fixture")
     parser.add_argument("--code-dir", type=Path, default=Path.cwd(),
                         help="SYMFLUENCE_CODE_DIR for the configs (default: cwd)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -326,7 +364,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     LOGGER.setLevel(logging.INFO)
 
-    outcome = run_benchmark(args.engines, args.workdir, args.outdir, args.code_dir)
+    if args.from_domain is not None:
+        results = results_from_domain(args.from_domain, args.engines)
+        outcome = BenchmarkOutcome(
+            results=results,
+            results_csv=write_results_csv(results, args.outdir),
+            comparison_png=write_comparison_png(results, args.outdir),
+        )
+    else:
+        outcome = run_benchmark(args.engines, args.workdir, args.outdir, args.code_dir)
 
     print("\nPhase-1 benchmark results")
     print("=" * 60)
