@@ -412,6 +412,10 @@ def build_and_run_emulator(
             # Lumped: single generic land HRU (CanadianShield: organic + bedrock).
             config_kwargs['HRUs'] = _build_hrus(emulators, hru, spec, logger)
 
+        custom_outputs = _build_custom_outputs(config, rc, logger)
+        if custom_outputs:
+            config_kwargs['CustomOutput'] = custom_outputs
+
         if spec['rain_snow_fraction']:
             config_kwargs['RainSnowFraction'] = spec['rain_snow_fraction']
         # PET override (e.g. CanadianShield: HARGREAVES_1985 -> OUDIN so no TEMP_MIN/MAX needed).
@@ -596,6 +600,48 @@ def _write_forcing_netcdf(forcing_df: pd.DataFrame, hru: Dict[str, Any], out: Pa
     out.parent.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(out, engine='netcdf4', encoding=encoding)
     ds.close()
+
+
+# Raven state variable -> (CustomOutput variable, calibration-target token) for the
+# non-streamflow objectives the plugin supports. SNOW is snow water equivalent (SWE) in mm;
+# AET is actual evapotranspiration in mm/day.
+_CUSTOM_OUTPUT_VARS = {'SWE': 'SNOW', 'SNOW': 'SNOW', 'ET': 'AET', 'AET': 'AET'}
+
+
+def _build_custom_outputs(config: Any, rc: Any, logger: logging.Logger) -> List[Any]:
+    """Build the Raven ``:CustomOutput`` list for any configured SWE/ET objective.
+
+    Emitted only when the config asks for a SWE/ET target — via OBJECTIVE_WEIGHTS keys, the
+    CALIBRATION_VARIABLE/OPTIMIZATION_TARGET, or an explicit RAVEN_CUSTOM_OUTPUTS list — so
+    streamflow-only runs pay no extra output cost. Daily basin-average (ENTIRE_WATERSHED),
+    which matches point/basin SWE and ET observation products.
+    """
+    requested: set = set()
+    explicit = _cfg(config, 'RAVEN_CUSTOM_OUTPUTS')
+    if explicit:
+        items = explicit if isinstance(explicit, (list, tuple)) else str(explicit).split(',')
+        requested.update(str(x).strip().upper() for x in items if str(x).strip())
+    weights = _cfg(config, 'OBJECTIVE_WEIGHTS')
+    if isinstance(weights, dict):
+        requested.update(str(k).strip().upper() for k in weights)
+    for key in ('CALIBRATION_VARIABLE', 'OPTIMIZATION_TARGET'):
+        val = _cfg(config, key)
+        if val:
+            requested.add(str(val).strip().upper())
+
+    variables: List[str] = []
+    for token in requested:
+        var = _CUSTOM_OUTPUT_VARS.get(token)
+        if var and var not in variables:
+            variables.append(var)
+    if not variables:
+        return []
+
+    outputs = [rc.CustomOutput(time_per='DAILY', stat='AVERAGE', variable=v,
+                               space_agg='ENTIRE_WATERSHED', filename='')
+               for v in variables]
+    logger.debug(f"Emitting Raven custom outputs: {variables}")
+    return outputs
 
 
 def _inject_avg_annual_runoff(emulator: Any, value_mm: float, logger: logging.Logger) -> None:

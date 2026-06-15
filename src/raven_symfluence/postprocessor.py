@@ -184,6 +184,55 @@ def write_routed_netcdf(
         return None
 
 
+def read_raven_custom_output(
+    custom_file: Path,
+    logger: logging.Logger,
+) -> Optional["pd.Series"]:
+    """Read a Raven ``:CustomOutput`` CSV (e.g. SNOW/AET, ENTIRE_WATERSHED) as a Series.
+
+    Raven writes custom outputs like ``<run>_SNOW_Daily_Average_ByWatershed.csv`` with a
+    two-row header (a group-name row, then ``time,day,mean``) followed by
+    ``index,date,value`` rows. We skip the group-name row so ``day`` is the date column and
+    the first value column (``mean`` for ENTIRE_WATERSHED) is the series. Units pass through
+    Raven-native: SNOW (SWE) in mm, AET in mm/day.
+    """
+    try:
+        df = pd.read_csv(custom_file, skiprows=1, skipinitialspace=True)
+        df.columns = [str(c).strip() for c in df.columns]
+        date_col = next((c for c in df.columns if c.lower() in ('day', 'date')), None)
+        if date_col is None:
+            logger.error(f"No date column in custom output {custom_file}")
+            return None
+        value_cols = [c for c in df.columns
+                      if c != date_col and not c.lower().startswith('unnamed')
+                      and c.lower() not in ('time',) and pd.api.types.is_numeric_dtype(df[c])]
+        if not value_cols:
+            logger.error(f"No value column in custom output {custom_file}")
+            return None
+        idx = pd.to_datetime(df[date_col], errors='coerce')
+        series = pd.Series(df[value_cols[0]].astype(float).values, index=idx)
+        series = series[series.index.notna()]
+        logger.debug(f"Read Raven custom output '{value_cols[0]}' ({len(series)} steps) "
+                     f"from {custom_file.name}")
+        return series
+    except Exception as e:  # noqa: BLE001 -- model execution resilience
+        logger.error(f"Error reading Raven custom output {custom_file}: {e}")
+        return None
+
+
+def find_custom_output_file(sim_dir: Path, variable: str) -> Optional[Path]:
+    """Locate a Raven custom-output CSV for *variable* (e.g. 'SNOW', 'AET')."""
+    sim_dir = Path(sim_dir)
+    for d in (sim_dir, sim_dir / 'output'):
+        if not d.exists():
+            continue
+        matches = sorted(d.glob(f'*{variable}*.csv'))
+        if matches:
+            return matches[0]
+    matches = sorted(sim_dir.rglob(f'*{variable}*.csv'))
+    return matches[0] if matches else None
+
+
 class RavenPostProcessor(StandardModelPostProcessor):
     """Postprocessor for the Raven hydrological modelling framework."""
 
@@ -231,4 +280,6 @@ __all__ = [
     'read_raven_streamflow',
     'read_raven_per_reach',
     'write_routed_netcdf',
+    'read_raven_custom_output',
+    'find_custom_output_file',
 ]
