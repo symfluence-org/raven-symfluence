@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 
-from _fixtures import build_distributed_attributes_store
+import pytest
+
+from _fixtures import build_delineation_shapefiles, build_distributed_attributes_store
 
 from raven_symfluence.distributed import (
     RAVEN_OUTLET_ID,
@@ -64,6 +66,31 @@ def test_read_topology_lumped_returns_none(tmp_path):
 
 def test_read_topology_no_store_returns_none(tmp_path):
     assert read_distributed_topology(tmp_path / "domain_missing", "missing", logger) is None
+
+
+def test_read_topology_from_delineation_shapefiles(tmp_path):
+    """When the store lacks routing vars, topology is read from river_network/river_basins."""
+    pytest.importorskip("geopandas", reason="geopandas not installed")
+    proj = tmp_path / "domain_shp"
+    # Segments 10->20->30, with 30's downstream (99) off-network => outlet at 30.
+    build_delineation_shapefiles(
+        proj, links=[10, 20, 30], downstream=[20, 30, 99],
+        length_m=[4000.0, 6000.0, 0.0], slope=[0.02, 0.0, 0.0],
+        contrib_area_m2=[1e7, 2e7, 3e7], gru_area_m2=[1e7, 1e7, 1e7])
+
+    net = read_distributed_topology(proj, "shp", logger)
+    assert net is not None and net.n_subbasins == 3
+
+    # LINKNOs are remapped to stable 1-based subbasin ids in row order (10->1, 20->2, 30->3).
+    by_id = {s.subbasin_id: s for s in net.subbasins}
+    assert by_id[1].downstream_id == 2
+    assert by_id[2].downstream_id == 3
+    assert by_id[3].downstream_id == RAVEN_OUTLET_ID         # off-network downstream -> outlet
+    # TauDEM DSContArea used directly for accumulated area.
+    assert by_id[3].accumulated_area_km2 == 30.0
+    # Zero slope floored to a positive value (Raven rejects zero bed slope).
+    assert by_id[2].river_slope > 0
+    assert by_id[1].reach_length_km == 4.0                   # 4000 m -> km
 
 
 class _FakeChannelProfile:

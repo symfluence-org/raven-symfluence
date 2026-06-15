@@ -94,20 +94,41 @@ def read_distributed_topology(
 ) -> Optional[DistributedNetwork]:
     """Read the river-network topology into a :class:`DistributedNetwork`.
 
-    Returns ``None`` (caller falls back to lumped) when the attributes store is absent,
-    has no ``topology`` group, or describes a single subbasin — there is nothing to route
-    in those cases, so the lumped path is the correct, simpler model.
+    Tries two sources, in order:
+
+    1. the attributes store's ``topology`` group, when it carries routing variables
+       (``downstream_id``/``river_length``/``river_slope``) — the ideal, pre-digested case;
+    2. the delineation **shapefiles** (``shapefiles/river_network`` TauDEM
+       ``LINKNO``/``DSLINKNO``/``Length``/``Slope``/``DSContArea`` + ``shapefiles/river_basins``
+       ``GRU_ID``/``GRU_area``/``gru_to_seg``) — where SYMFLUENCE actually stores connectivity
+       for delineated domains (the attributes builder does not always propagate it).
+
+    Returns ``None`` (caller falls back to lumped) when neither source yields a routable
+    multi-subbasin network — the correct, simpler model when there is nothing to route.
     """
     from symfluence.data.model_ready.attributes_reader import open_canonical_attributes
 
     reader = open_canonical_attributes(project_dir, domain_name)
-    if reader is None:
-        logger.debug("No attributes store; distributed topology unavailable")
-        return None
-    if not reader.has_group('topology'):
-        logger.debug("Attributes store has no 'topology' group; cannot build distributed network")
+
+    network = _read_topology_from_store(reader, logger)
+    source = "attributes store topology group"
+    if network is None:
+        network = _read_topology_from_shapefiles(project_dir, domain_name, reader, logger)
+        source = "delineation shapefiles"
+    if network is None:
         return None
 
+    network.avg_annual_runoff_mm = _estimate_avg_annual_runoff(project_dir, domain_name, logger)
+    logger.info(
+        f"Built distributed Raven network from {source}: {network.n_subbasins} subbasins "
+        f"(one HRU each), AvgAnnualRunoff={network.avg_annual_runoff_mm:.0f} mm/yr")
+    return network
+
+
+def _read_topology_from_store(reader, logger: logging.Logger) -> Optional[DistributedNetwork]:
+    """Build the network from the attributes store ``topology`` group (when routable)."""
+    if reader is None or not reader.has_group('topology'):
+        return None
     try:
         import numpy as np
 
@@ -115,19 +136,12 @@ def read_distributed_topology(
             id_var = next((v for v in ('gru_id', 'hru_id', 'subbasin_id') if v in ds.variables),
                           None)
             if id_var is None:
-                logger.debug("Topology group has no id coordinate; using lumped model")
                 return None
             gru_ids = [str(x) for x in np.atleast_1d(ds[id_var].values)]
-            if len(gru_ids) < 2:
+            if len(gru_ids) < 2 or 'downstream_id' not in set(ds.variables):
                 logger.debug(
-                    f"Topology has {len(gru_ids)} subbasin(s); using lumped model "
-                    "(nothing to route)")
-                return None
-            tvars = set(ds.variables)
-            if 'downstream_id' not in tvars:
-                logger.debug(
-                    "Topology group lacks 'downstream_id' (lumped/undelineated domain); "
-                    "using lumped model")
+                    "Topology group not routable (single subbasin or no 'downstream_id'); "
+                    "trying delineation shapefiles")
                 return None
             downstream = [str(v) for v in np.atleast_1d(ds['downstream_id'].values)]
             areas_m2 = _values_or_none(ds, ['gru_area', 'area'])
@@ -140,17 +154,122 @@ def read_distributed_topology(
         if len(specs) < 2:
             return None
         _accumulate_drainage_area(specs)
-
-        network = DistributedNetwork(subbasins=specs)
-        network.avg_annual_runoff_mm = _estimate_avg_annual_runoff(
-            project_dir, domain_name, logger)
-        logger.info(
-            f"Built distributed Raven network: {network.n_subbasins} subbasins "
-            f"(one HRU each), AvgAnnualRunoff={network.avg_annual_runoff_mm:.0f} mm/yr")
-        return network
-    except Exception as e:  # noqa: BLE001 -- absent/partial store => lumped fallback
-        logger.warning(f"Could not read distributed topology ({e}); falling back to lumped")
+        return DistributedNetwork(subbasins=specs)
+    except Exception as e:  # noqa: BLE001 -- partial store => shapefile fallback
+        logger.debug(f"Store topology not usable ({e}); trying delineation shapefiles")
         return None
+
+
+def _read_topology_from_shapefiles(
+    project_dir: Path,
+    domain_name: str,
+    reader,
+    logger: logging.Logger,
+) -> Optional[DistributedNetwork]:
+    """Build the network from TauDEM delineation shapefiles (river_network + river_basins).
+
+    river_network carries the routing graph (``LINKNO`` -> ``DSLINKNO``, ``Length`` [m],
+    ``Slope``, accumulated ``DSContArea`` [m^2]); river_basins maps each GRU to a segment
+    (``gru_to_seg``) and carries ``GRU_area`` [m^2]. We model one land HRU per GRU/segment;
+    a ``DSLINKNO`` that points off-network (no matching ``LINKNO``) is the outlet.
+    """
+    rn_shp = _find_shapefile(project_dir, 'river_network')
+    rb_shp = _find_shapefile(project_dir, 'river_basins')
+    if rn_shp is None or rb_shp is None:
+        logger.debug("No river_network/river_basins shapefiles; cannot build distributed network")
+        return None
+    try:
+        import geopandas as gpd
+
+        rn = gpd.read_file(rn_shp)
+        rb = gpd.read_file(rb_shp)
+        link_col = _pick_col(rn, ['LINKNO', 'linkno', 'seg_id', 'segId'])
+        ds_col = _pick_col(rn, ['DSLINKNO', 'dslinkno', 'downSegId', 'downstream_id'])
+        len_col = _pick_col(rn, ['Length', 'length', 'river_length', 'RivLength'])
+        slope_col = _pick_col(rn, ['Slope', 'slope', 'river_slope', 'RivSlope'])
+        acc_col = _pick_col(rn, ['DSContArea', 'uparea', 'contribarea'])
+        gru_col = _pick_col(rb, ['GRU_ID', 'gru_id', 'HRU_ID'])
+        seg_col = _pick_col(rb, ['gru_to_seg', 'hru_to_seg', 'seg_id', 'GRU_to_seg'])
+        area_col = _pick_col(rb, ['GRU_area', 'gru_area', 'HRU_area', 'Area'])
+        if link_col is None or ds_col is None:
+            logger.debug("river_network lacks LINKNO/DSLINKNO; cannot build distributed network")
+            return None
+        if len(rn) < 2:
+            return None
+
+        # GRU -> segment, GRU -> area (default: GRU id IS the segment id when no mapping col).
+        seg_of_gru, area_of_seg = {}, {}
+        for _, r in rb.iterrows():
+            gid = int(r[gru_col]) if gru_col else None
+            seg = int(r[seg_col]) if seg_col else gid
+            if seg is None:
+                continue
+            if area_col is not None:
+                area_of_seg[seg] = float(r[area_col])
+            if gid is not None:
+                seg_of_gru[gid] = seg
+
+        segs = [int(v) for v in rn[link_col].tolist()]
+        seg_set = set(segs)
+        seg_to_int = {seg: i + 1 for i, seg in enumerate(segs)}   # stable 1-based Raven ids
+        per_hru = _read_hru_geometry(reader, [str(s) for s in segs], logger) if reader else {}
+
+        specs: List[SubbasinSpec] = []
+        for _, r in rn.iterrows():
+            seg = int(r[link_col])
+            ds_raw = int(r[ds_col])
+            ds_id = seg_to_int.get(ds_raw, RAVEN_OUTLET_ID) if ds_raw in seg_set else RAVEN_OUTLET_ID
+            length_km = max(float(r[len_col]) / 1000.0, 0.0) if len_col else 0.0
+            slope = max(float(r[slope_col]), _MIN_RIVER_SLOPE) if slope_col else _MIN_RIVER_SLOPE
+            acc_km2 = (float(r[acc_col]) / 1e6) if acc_col else 0.0
+            area_km2 = area_of_seg.get(seg, 0.0) / 1e6
+            geom = per_hru.get(str(seg), {})
+            if area_km2 <= 0:
+                area_km2 = geom.get('area_km2', max(acc_km2, 1.0))
+            specs.append(SubbasinSpec(
+                subbasin_id=seg_to_int[seg],
+                downstream_id=ds_id,
+                area_km2=area_km2,
+                reach_length_km=round(length_km, 5),
+                river_slope=slope,
+                elevation=geom.get('elevation', 1000.0),
+                latitude=geom.get('latitude', 0.0),
+                longitude=geom.get('longitude', 0.0),
+                accumulated_area_km2=acc_km2,
+            ))
+        if len(specs) < 2:
+            return None
+        # Use TauDEM's DSContArea when present; otherwise accumulate from connectivity.
+        if not acc_col:
+            _accumulate_drainage_area(specs)
+        n_outlets = sum(1 for s in specs if s.downstream_id == RAVEN_OUTLET_ID)
+        logger.debug(f"Shapefile topology: {len(specs)} subbasins, {n_outlets} outlet(s)")
+        return DistributedNetwork(subbasins=specs)
+    except Exception as e:  # noqa: BLE001 -- unreadable shapefiles => lumped fallback
+        logger.warning(f"Could not read delineation shapefiles ({e}); falling back to lumped")
+        return None
+
+
+def _find_shapefile(project_dir: Path, subdir: str) -> Optional[Path]:
+    """Locate the first ``.shp`` under ``{project_dir}/shapefiles/{subdir}``."""
+    d = Path(project_dir) / 'shapefiles' / subdir
+    if not d.exists():
+        return None
+    shps = sorted(d.glob('*.shp'))
+    return shps[0] if shps else None
+
+
+def _pick_col(df, candidates: List[str]) -> Optional[str]:
+    """Return the first candidate column present in *df* (case-sensitive then -insensitive)."""
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    lower = {str(c).lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
 
 
 def _values_or_none(ds, names: List[str]):
@@ -172,12 +291,26 @@ def _read_hru_geometry(reader, gru_ids: List[str],
     when the HRU and GRU counts match, else (3) the domain mean. Any field a store omits
     falls back to a sensible default.
     """
-    area = reader.per_hru_values('hru_identity', 'hru_area') or {}
-    lat = reader.per_hru_values('hru_identity', 'latitude') or {}
-    lon = reader.per_hru_values('hru_identity', 'longitude') or {}
-    elev = (reader.per_hru_values('terrain', 'elev_mean')
-            or reader.per_hru_values('terrain', 'elevation') or {})
     hru_order = reader.hru_ids('hru_identity') or []
+
+    def _id_map(group: str, names: List[str]) -> Dict[str, float]:
+        """Return {hru_id: value}, joining by the group's own hru_id when present, else by
+        position against the canonical hru_identity id order (groups like 'terrain' carry no
+        hru_id coordinate, but their rows are written in the same order as hru_identity)."""
+        for name in names:
+            d = reader.per_hru_values(group, name)
+            if d:
+                return d
+        for name in names:
+            arr = reader.variable(group, name)
+            if arr is not None and hru_order and len(arr) == len(hru_order):
+                return {hid: float(v) for hid, v in zip(hru_order, arr)}
+        return {}
+
+    area = _id_map('hru_identity', ['hru_area'])
+    lat = _id_map('hru_identity', ['latitude', 'lat'])
+    lon = _id_map('hru_identity', ['longitude', 'lon'])
+    elev = _id_map('terrain', ['elev_mean', 'elevation'])
 
     def _aligned(d: Dict[str, float], default: float) -> Dict[str, float]:
         vals = list(d.values())

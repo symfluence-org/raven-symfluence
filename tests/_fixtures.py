@@ -64,6 +64,54 @@ def build_distributed_attributes_store(
     return store
 
 
+def build_delineation_shapefiles(
+    project_dir: Path,
+    links: List[int],
+    downstream: List[int],
+    *,
+    length_m: Optional[List[float]] = None,
+    slope: Optional[List[float]] = None,
+    contrib_area_m2: Optional[List[float]] = None,
+    gru_area_m2: Optional[List[float]] = None,
+) -> None:
+    """Write TauDEM-style river_network + river_basins shapefiles (1 GRU per segment).
+
+    Mirrors a SYMFLUENCE delineated domain: river_network carries LINKNO/DSLINKNO/Length/
+    Slope/DSContArea; river_basins carries GRU_ID/GRU_area/gru_to_seg (GRU id == segment).
+    A DSLINKNO with no matching LINKNO marks the outlet.
+    """
+    import geopandas as gpd
+    from shapely.geometry import LineString, Polygon
+
+    n = len(links)
+    length_m = length_m or [5000.0] * n
+    slope = slope or [0.01] * n
+    contrib_area_m2 = contrib_area_m2 or [(i + 1) * 1e7 for i in range(n)]
+    gru_area_m2 = gru_area_m2 or [1e7] * n
+
+    rn = gpd.GeoDataFrame({
+        'LINKNO': links,
+        'DSLINKNO': downstream,
+        'Length': length_m,
+        'Slope': slope,
+        'DSContArea': contrib_area_m2,
+        'geometry': [LineString([(i, 0), (i + 1, 0)]) for i in range(n)],
+    }, crs='EPSG:4326')
+    rb = gpd.GeoDataFrame({
+        'GRU_ID': links,
+        'GRU_area': gru_area_m2,
+        'gru_to_seg': links,
+        'geometry': [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(n)],
+    }, crs='EPSG:4326')
+
+    rn_dir = project_dir / 'shapefiles' / 'river_network'
+    rb_dir = project_dir / 'shapefiles' / 'river_basins'
+    rn_dir.mkdir(parents=True, exist_ok=True)
+    rb_dir.mkdir(parents=True, exist_ok=True)
+    rn.to_file(rn_dir / 'river_network.shp')
+    rb.to_file(rb_dir / 'river_basins.shp')
+
+
 def write_canonical_forcing(
     project_dir: Path,
     domain_name: str,
